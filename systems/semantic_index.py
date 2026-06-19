@@ -3,7 +3,6 @@ import faiss
 import numpy as np
 import hashlib
 from tools.embedder import embed_text
-from tools.index_storage import load_index
 from core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -86,18 +85,25 @@ def remove_entities_from_faiss(entities):
     faiss_idx.remove_ids(ids_np)
     save_faiss_index()
 
-def sync_faiss_with_ast():
+def sync_faiss_with_ast(entities):
+    """
+    Pure cache implementation: rebuilds the local FAISS tracking using an externally 
+    supplied collection of index source entities. No session or disk load knowledge.
+    """
     global _faiss_index
-    index_data = load_index()
     
     flat = faiss.IndexFlatL2(DIMENSION)
     _faiss_index = faiss.IndexIDMap(flat)
     
-    add_entities_to_faiss(index_data)
+    add_entities_to_faiss(entities)
 
-def search_semantic(query, top_k=3):
+def search_semantic(entities, query, top_k=3):
+    """
+    Performs similarity search over vector mappings and cross-references matching elements
+    against the provided entities collection context wrapper.
+    """
     faiss_idx = get_faiss_index()
-    if faiss_idx.ntotal == 0:
+    if faiss_idx.ntotal == 0 or not entities:
         return []
         
     q_emb = embed_text([query])
@@ -110,8 +116,7 @@ def search_semantic(query, top_k=3):
     target_ids = set(indices[0])
     
     results = []
-    index_data = load_index()
-    for item in index_data:
+    for item in entities:
         if generate_entity_id(item) in target_ids:
             results.append(item)
             
