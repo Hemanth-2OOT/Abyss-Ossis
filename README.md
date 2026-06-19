@@ -2,7 +2,9 @@
 
 > A local-first, zero-cost AI coding agent powered by Qwen 2.5 Coder 7B.
 > Works like Claude Code / Cursor — but runs entirely on your machine.
-
+ 
+![status](https://img.shields.io/badge/status-active-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-blue)
 ---
 
 ## Table of Contents
@@ -521,3 +523,6 @@ WHITELIST_DIRS = []            # Allow access outside workspace
 ---
 
 *Built with ❤️ for developers who want AI coding without the cloud.*
+## Star History
+
+If this project helps you, consider starring it ⭐
