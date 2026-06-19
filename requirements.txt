@@ -1,0 +1,6 @@
+requests
+numpy
+rich
+faiss-cpu
+fastapi
+uvicorn

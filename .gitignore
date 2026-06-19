@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+
+data/
+*.log
+
+.localagent.index.json
+.localagent.memory.json
+.localagent.logs.txt
+
+.env
