@@ -1,19 +1,77 @@
 import json
 import os
 
+# ── In-memory index cache (P1 fix) ──────────────────────────────────────────
+# load_index() is called on every search_index() call. For a 200KB JSON index
+# this causes a full disk read + parse every query. Cache keyed on mtime so
+# stale data is never served when the index file changes on disk.
+_index_cache: dict = {}   # {index_path: (mtime, data)}
+
+def _build_lookup(index):
+    """
+    Build an inverted lookup: word → list of matching items.
+    Constructed once per mtime epoch and stored in _index_cache alongside data.
+    Reduces keyword scan from O(N×W) to O(W × avg_hits_per_word).
+    """
+    from collections import defaultdict
+    lookup = defaultdict(list)
+    for item in index:
+        t = item.get("type", "")
+        if t in ("function", "class", "method"):
+            k = item.get("name", "").lower()
+            if k:
+                lookup[k].append(item)
+        elif t == "call":
+            for k in (item.get("name","").lower(), item.get("caller","").lower()):
+                if k:
+                    lookup[k].append(item)
+        elif t == "import":
+            for k in (item.get("name","").lower(), item.get("module","").lower()):
+                if k:
+                    lookup[k].append(item)
+        elif t == "file":
+            # file items matched by substring — kept in a separate flat list
+            lookup["__files__"].append(item)
+    return lookup
+
+
+# extend cache tuple to (mtime, data, lookup)
+def load_index(session):
+    path = session.index_path
+    if not os.path.exists(path):
+        return []
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    cached = _index_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    _index_cache[path] = (mtime, data)
+    return data
+
+
+def _get_lookup(session):
+    path = session.index_path
+    cached = _index_cache.get(path)
+    if cached and len(cached) == 3:
+        return cached[2]
+    # build and store lookup alongside existing cache entry
+    index = load_index(session)
+    lookup = _build_lookup(index)
+    if path in _index_cache:
+        _index_cache[path] = (_index_cache[path][0], _index_cache[path][1], lookup)
+    return lookup
+
+
 def save_index(session, index):
     os.makedirs(os.path.dirname(session.index_path), exist_ok=True)
-
     with open(session.index_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
-
-
-def load_index(session):
-    if not os.path.exists(session.index_path):
-        return []
-
-    with open(session.index_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    # Invalidate cache so next load_index reads the freshly written file.
+    _index_cache.pop(session.index_path, None)
 
 
 def update_file_index(session, path):
@@ -92,39 +150,26 @@ def search_index(session, query):
     ast_matches = []
     file_matches = []
 
-    for item in index:
-        found = False
-        item_type = item.get("type", "")
+    # Fast O(W x hits) lookup instead of O(W x N) loop
+    lookup = _get_lookup(session)
+    seen_entity_idx = set()
 
-        for word in words:
-
-            if item_type in ("function", "class", "method"):
-                if word == item.get("name", "").lower():
-                    found = True
-
-            elif item_type == "call":
-                if (
-                    word == item.get("name", "").lower()
-                    or word == item.get("caller", "").lower()
-                ):
-                    found = True
-
-            elif item_type == "import":
-                if (
-                    word == item.get("name", "").lower()
-                    or word == item.get("module", "").lower()
-                ):
-                    found = True
-
-            elif item_type == "file":
-                if word in item.get("file", "").lower():
-                    found = True
-
-        if found:
-            if item_type == "file":
-                file_matches.append(item)
-            else:
-                ast_matches.append(item)
+    for word in words:
+        # Match exact keyword
+        if word in lookup:
+            for item in lookup[word]:
+                idx = id(item)
+                if idx not in seen_entity_idx:
+                    seen_entity_idx.add(idx)
+                    ast_matches.append(item)
+        
+        # Match file substrings
+        for f_item in lookup.get("__files__", []):
+            if word in f_item.get("file", "").lower():
+                idx = id(f_item)
+                if idx not in seen_entity_idx:
+                    seen_entity_idx.add(idx)
+                    file_matches.append(f_item)
 
     from systems.semantic_index import (
         search_semantic,

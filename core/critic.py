@@ -1,9 +1,7 @@
 from systems.ollama_client import chat_ollama
+from config import CRITIC_MODEL
 
 
-# Tool names whose successful execution means the task is complete.
-# Don't send these to the critic — a successful write IS the answer.
-_WRITE_TOOLS = {"write_file", "replace_chunk"}
 
 
 def critique_response(
@@ -18,33 +16,15 @@ def critique_response(
     """
     Returns: "OK" or "NEEDS_MORE_INFO"
 
-    Short-circuits to OK when:
-    - A write/replace tool succeeded (task is done by definition)
-    - Retrieval was used for a lookup-style question
+    B8 fix: removed blind short-circuit that returned OK any time write_file
+    succeeded. A file can be written with syntactically valid but semantically
+    wrong code — the LLM critic must still verify the content addresses the
+    user's request. write_file success is now passed as evidence to the prompt
+    so the LLM can weigh it, but does not bypass evaluation entirely.
     """
 
-    # ── Short-circuit 1: successful file write ────────────────────────────
-    # The critic never sees tool results directly — it only sees the model's
-    # prose summary, which is often vague ("Created main.py..."). That's
-    # enough for a 7B critic to flag NEEDS_MORE_INFO even on success.
-    # Solution: bypass the critic entirely when a write tool succeeded.
-    if (
-        last_tool_name in _WRITE_TOOLS
-        and last_tool_result is not None
-        and not str(last_tool_result).startswith("Error:")
-    ):
-        return "OK"
-
-    # ── Short-circuit 2: retrieval-backed lookup ──────────────────────────
-    if retrieval_used and match_count > 0:
-        lookup_words = ["where is", "defined", "which file", "who calls", "find", "locate"]
-        if any(w in user_input.lower() for w in lookup_words):
-            return "OK"
-
     system_prompt = """
-You are a strict critic agent.
-
-Your job is to determine whether the assistant's answer is supported by available evidence.
+You are a critic agent reviewing an assistant's proposed response or action against available evidence.
 
 Return ONLY one of:
 
@@ -61,19 +41,34 @@ If retrieval_used=True and context_matches > 0:
 
 Return NEEDS_MORE_INFO ONLY if:
 - debugging request has no code, logs, or errors to work from
-- coding request is missing core requirements
+- coding request is missing core requirements (e.g. wrote empty file, wrong filename)
 - file analysis requested but no file content was provided
 - assistant's answer directly contradicts the retrieved context
+- a file was written but its content clearly does not address the user's request
 
 Return OK if:
-- A file was written or edited successfully
-- The assistant's answer is consistent with the retrieved context
-- The answer directly addresses the user's question
+- The assistant's answer is consistent with the retrieved context AND addresses the request
+- A file was successfully written AND its content plausibly addresses the user's request
+- The answer directly and completely addresses the user's question
 
 Output ONE WORD ONLY: OK or NEEDS_MORE_INFO
 """
 
-    context_preview = context[:1000] if context else ""
+    # T4 fix: critic only needs to assess intent, not read every line of code.
+    # Truncate response to 800 chars (~200 tokens). Full 4096-token responses
+    # were billing the critic the same cost as the worker for a yes/no decision.
+    response_preview = response[:800] if len(response) > 800 else response
+
+    # Only include retrieved context when it was actually used — otherwise it
+    # adds ~250 tokens for evidence that played no role in the answer.
+    context_preview = (context[:800] if context else "") if retrieval_used else ""
+
+    # Build last-tool evidence line for the critic
+    tool_evidence = ""
+    if last_tool_name and last_tool_result is not None:
+        result_str = str(last_tool_result)
+        status = "FAILED" if result_str.startswith("Error:") else "SUCCEEDED"
+        tool_evidence = f"Last Tool: {last_tool_name} → {status}\nResult snippet: {result_str[:300]}"
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -81,18 +76,23 @@ Output ONE WORD ONLY: OK or NEEDS_MORE_INFO
             "role": "user",
             "content": (
                 f"User Question:\n{user_input}\n\n"
-                f"Assistant Response:\n{response}\n\n"
+                f"Assistant Response:\n{response_preview}\n\n"
                 f"Retrieval Used:\n{retrieval_used}\n\n"
                 f"Context Matches:\n{match_count}\n\n"
-                f"Retrieved Context:\n{context_preview}"
+                f"Retrieved Context:\n{context_preview}\n\n"
+                f"{tool_evidence}"
             ),
         },
     ]
 
     try:
-        result = chat_ollama(messages).strip().upper()
-        if result == "OK":
-            return "OK"
-        return "NEEDS_MORE_INFO"
-    except Exception:
-        return "OK"  # fail open
+        # High determinism configuration (temp=0) with 32 token ceiling
+        res = chat_ollama(
+            messages,
+            model=CRITIC_MODEL,
+            num_predict=32,
+            temperature=0
+        )
+        return res.strip()
+    except Exception as e:
+        return f"Error: Critic LLM failed - {str(e)}"

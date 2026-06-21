@@ -29,6 +29,13 @@ def read_file(path):
         if os.path.isdir(safe_path):
             return f"Error: '{path}' is a directory, not a file."
 
+        # Prevent massive memory consumption/OOM on huge files (limit: 2MB)
+        try:
+            if os.path.getsize(safe_path) > 2 * 1024 * 1024:
+                return f"Error: File '{path}' exceeds the 2MB read limit. Cannot load into agent memory."
+        except OSError as e:
+            return f"Error: Cannot access file '{path}': {e}"
+
         with open(safe_path, "r", encoding="utf-8") as f:
             content = f.read()
 

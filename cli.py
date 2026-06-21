@@ -8,13 +8,17 @@ import subprocess
 from threading import Thread
 from queue import Queue, Empty
 from collections import defaultdict
-from config import MODEL
+import config
+from config import DEFAULT_MODEL
 print("CWD:", os.getcwd())
 from rich.console import Console
 from core.logger import get_logger
 from systems.state import AgentState
 from core.orchestrator import classify_task
 from core.worker import run_worker
+from core.metrics import MetricsTracker
+from core.tool_dispatcher import ToolDispatcher
+from core.resource_monitor import ResourceSafetyError, watchdog
 from core.critic import critique_response
 from core.guards import requires_more_info
 
@@ -33,6 +37,7 @@ from core.session import ProjectSession
 console = Console()
 state = AgentState()
 logger = get_logger("cli")
+metrics = MetricsTracker()
 
 PKG_ALIASES = {
     "PIL":     "Pillow",
@@ -203,6 +208,7 @@ def _infer_expected_artifacts(user_input, plan_steps):
 
 
 def main(session):
+    watchdog.start()
     BANNER = """[bold purple]
     ╔══════════════════════════════════════════════════════════════════╗
     ║                                                                ║
@@ -223,7 +229,7 @@ def main(session):
     ╚══════════════════════════════════════════════════════════════════╝[/bold purple]"""
 
     console.print(BANNER)
-    console.print(f"  [dim] Local AI Coding Agent · {MODEL} · Ollama [/dim]")
+    console.print(f"  [dim] Local AI Coding Agent · {DEFAULT_MODEL} · Ollama [/dim]")
     console.print(f"  [dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]")
     console.print(f"  [bold white]Workspace:[/bold white]  [cyan]{session.root}[/cyan]")
     console.print(f"  [bold white]Memory:[/bold white]     [cyan]{session.memory_path}[/cyan]")
@@ -300,6 +306,10 @@ def main(session):
 
             if user_input.startswith("/ls"):
                 console.print(list_files(), style="cyan", markup=False)
+                continue
+
+            if user_input.startswith("/health"):
+                console.print(watchdog.health())
                 continue
 
             if user_input.startswith("/read"):
@@ -383,7 +393,10 @@ def main(session):
                     console.print(read_file(tool["path"]), markup=False)
                 continue
 
-            # ── AGENT PIPELINE ────────────────────────────────────────────
+            # ── TASK CLASSIFICATION ──────────────────────────────────────────
+            watchdog.set_required_model(config.PLANNER_MODEL)
+            watchdog.check()
+            metrics.record_llm_call()
             task = classify_task(user_input)
             console.print(f"[yellow]Task: {task}[/yellow]")
 
@@ -403,6 +416,7 @@ def main(session):
             if task.get("needs_planner"):
                 from core.planner import generate_plan
                 console.print("[yellow]Generating execution plan...[/yellow]")
+                metrics.record_llm_call()
                 plan_steps = generate_plan(user_input, full_context)
                 console.print("\n[bold cyan]Execution Plan:[/bold cyan]")
                 for i, step in enumerate(plan_steps, 1):
@@ -452,6 +466,7 @@ def main(session):
                 console.print(f"[dim]Prompt chars={prompt_size}, Context chars={context_size}[/dim]")
 
                 call_start = time.time()
+                metrics.record_llm_call()
                 response_stream = run_worker(session, task, worker_history, full_context, stream=True)
                 console.print(
                     f"[dim]run_worker returned generator in {time.time()-call_start:.2f}s[/dim]"
@@ -607,12 +622,14 @@ def main(session):
                         )
                     })
                     tool_loops += 1
+                    metrics.record_retry()
                     continue
 
                 if parsed_response and isinstance(parsed_response, dict):
                     resp_type = parsed_response.get("type")
 
                     if resp_type == "tool_call" and tool_loops < max_tool_loops:
+                        metrics.tool_calls += 1
                         tool_name = parsed_response.get("tool")
                         args      = parsed_response.get("args", {})
                         console.print("\n[magenta]Tool Call:[/magenta] ", end="")
@@ -843,6 +860,12 @@ def main(session):
                                     else:
                                         tool_result_dict["success"] = False
                                         tool_result_dict["stderr"] = "Command aborted by user."
+                            elif tool_name == "print_message":
+                                msg = args.get("message", "")
+                                console.print(f"[bold green]Message:[/bold green] {msg}")
+                                response_content = msg
+                                task_completed = True
+                                break
                             else:
                                 tool_result_dict["success"] = False
                                 tool_result_dict["stderr"] = f"Error: Unknown tool '{tool_name}'"
@@ -921,6 +944,7 @@ def main(session):
                             })
 
                         tool_loops += 1
+                        metrics.record_retry()
                         continue
 
                     elif resp_type == "response":
@@ -945,6 +969,7 @@ def main(session):
                     break
 
                 # ── Critic Bypass Gate ────────────────────────────────────
+                metrics.record_llm_call()
                 critic = critique_response(
                     user_input=user_input,
                     response=response_content,
@@ -959,6 +984,7 @@ def main(session):
 
                 if "NEEDS_MORE_INFO" in critic:
                     passes += 1
+                    metrics.record_retry()
 
                     if task.get("task_type") == "coding" and passes == 1:
                         console.print("[yellow]Critic flagged — auto-retrying once before asking.[/yellow]")
@@ -1001,10 +1027,23 @@ def main(session):
             session.log(f"AGENT: {response_content}")
             state.add_message("assistant", response_content)
 
+            ctx_size = len(locals().get("full_context") or "")
+            console.print(metrics.finish_task(context_size=ctx_size))
+            
+            from systems.ollama_client import unload_active_models
+            unload_active_models()
+
+        except ResourceSafetyError as e:
+            console.print(f"\n{e}\n", markup=False)
+            metrics.resource_failures += 1
+            watchdog.wait_for_cooldown()
+            
+            from systems.ollama_client import unload_active_models
+            unload_active_models()
         except RuntimeError as e:
             console.print("[bold yellow]Agent Error:[/bold yellow] ", end="")
             console.print(str(e), markup=False, highlight=False)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError, StopIteration):
             console.print("\n[yellow]Interrupted.[/yellow]")
             break
         except Exception as e:

@@ -34,7 +34,14 @@ def save_faiss_index():
         faiss.write_index(_faiss_index, FAISS_INDEX_FILE)
 
 def generate_entity_id(item):
-    unique_str = f"{item.get('file', '')}_{item.get('type', '')}_{item.get('name', item.get('module', ''))}"
+    # B1 fix: include 'class' so methods with the same name in the same file
+    # (e.g. two classes both having a 'run' method) get distinct IDs.
+    unique_str = (
+        f"{item.get('file', '')}_"
+        f"{item.get('type', '')}_"
+        f"{item.get('class', '')}_"
+        f"{item.get('name', item.get('module', ''))}"
+    )
     return int(hashlib.md5(unique_str.encode('utf-8')).hexdigest()[:15], 16)
 
 def build_entity_text(item):
@@ -68,11 +75,19 @@ def add_entities_to_faiss(entities):
         if emb:
             embeddings.extend(emb)
         else:
-            embeddings.extend([[0.0]*DIMENSION for _ in batch])
+            raise RuntimeError(f"Embedding generation failed for batch. Aborting to prevent FAISS corruption.")
             
     embeddings_np = np.array(embeddings, dtype=np.float32)
     ids_np = np.array(ids, dtype=np.int64)
-    
+
+    # Upsert guard: IndexIDMap does NOT replace on duplicate ID — both vectors
+    # persist, corrupting search ranking. Remove any pre-existing vectors with
+    # these IDs before inserting so add_with_ids is always a true upsert.
+    try:
+        faiss_idx.remove_ids(ids_np)
+    except Exception:
+        pass  # index may not support remove_ids if it has no entries yet
+
     faiss_idx.add_with_ids(embeddings_np, ids_np)
     save_faiss_index()
 
@@ -85,16 +100,27 @@ def remove_entities_from_faiss(entities):
     faiss_idx.remove_ids(ids_np)
     save_faiss_index()
 
-def sync_faiss_with_ast(entities):
+def sync_faiss_with_ast(entities, force_rebuild=True):
     """
-    Pure cache implementation: rebuilds the local FAISS tracking using an externally 
-    supplied collection of index source entities. No session or disk load knowledge.
+    Syncs the FAISS index with the supplied AST entities.
+
+    force_rebuild=True  (default, used by /index command):
+        Wipes the in-memory index and rebuilds from scratch.
+    force_rebuild=False (used by incremental update_file_index):
+        Appends new entities without destroying existing vectors.
+        Callers are responsible for removing stale entities first via
+        remove_entities_from_faiss() before calling this.
+
+    B9 fix: the old implementation always replaced _faiss_index with an
+    empty index, causing the in-memory state to diverge from the on-disk
+    .bin file when called mid-session.
     """
     global _faiss_index
-    
-    flat = faiss.IndexFlatL2(DIMENSION)
-    _faiss_index = faiss.IndexIDMap(flat)
-    
+
+    if force_rebuild:
+        flat = faiss.IndexFlatL2(DIMENSION)
+        _faiss_index = faiss.IndexIDMap(flat)
+
     add_entities_to_faiss(entities)
 
 def search_semantic(entities, query, top_k=3):
@@ -111,7 +137,7 @@ def search_semantic(entities, query, top_k=3):
         return []
         
     q_emb_np = np.array(q_emb, dtype=np.float32)
-    distances, indices = faiss_idx.search(q_emb_np, top_k)
+    _, indices = faiss_idx.search(q_emb_np, top_k)
     
     target_ids = set(indices[0])
     

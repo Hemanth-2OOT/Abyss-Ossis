@@ -2,7 +2,7 @@
 context_builder.py
 
 Builds a context block from retrieved index matches.
-Enforces a strict character budget to avoid flooding small model context windows.
+Enforces an adaptive character budget to avoid flooding small model context windows.
 
 Budget hierarchy:
   1. AST matches (function/method/class) — highest priority, full source
@@ -10,10 +10,11 @@ Budget hierarchy:
   3. File fallback entries — truncated snippets only
 """
 
-# ~2500 chars ≈ ~600 tokens, leaving room for system prompt + user message
-MAX_CONTEXT_CHARS = 2500
-# Max number of total matches rendered, regardless of budget
-MAX_MATCHES = 6
+DEFAULT_CONTEXT_CHARS = 2500
+CODING_CONTEXT_CHARS = 8500
+
+DEFAULT_MATCHES = 6
+CODING_MATCHES = 14
 
 
 def _render_match(item):
@@ -27,9 +28,9 @@ def _render_match(item):
         if item.get("docstring"):
             lines.append(f"Docstring: {item['docstring']}")
         source = item.get("source", "")
-        # Truncate very long function bodies
-        if len(source) > 800:
-            source = source[:800] + "\n... (truncated)"
+        # Truncate very long function bodies dynamically based on context sizes
+        if len(source) > 1500:
+            source = source[:1500] + "\n... (truncated)"
         lines.append(f"Source:\n{source}")
 
     elif item_type == "class":
@@ -40,8 +41,8 @@ def _render_match(item):
         if methods:
             lines.append(f"Methods: {', '.join(methods)}")
         source = item.get("source", "")
-        if len(source) > 600:
-            source = source[:600] + "\n... (truncated)"
+        if len(source) > 1200:
+            source = source[:1200] + "\n... (truncated)"
         lines.append(f"Source:\n{source}")
 
     elif item_type == "call":
@@ -52,8 +53,7 @@ def _render_match(item):
 
     elif item_type == "file":
         content = item.get("content", "")
-        # File fallbacks get very short snippets
-        lines.append(f"Content snippet:\n{content[:400]}")
+        lines.append(f"Content snippet:\n{content[:600]}")
 
     else:
         lines.append(str(item))
@@ -61,36 +61,47 @@ def _render_match(item):
     return "\n".join(lines)
 
 
-def build_context(matches):
+def build_context(matches, task_type="general"):
     """
-    Build a budget-capped context string from a list of index matches.
+    Build an adaptive, budget-capped context string from a list of index matches.
     Returns empty string if no matches.
     """
     if not matches:
         return ""
 
-    # Partition matches by priority tier
-    ast_matches = [m for m in matches if m.get("type") in ("function", "method", "class")]
-    other_matches = [m for m in matches if m.get("type") not in ("function", "method", "class", "file")]
-    file_matches = [m for m in matches if m.get("type") == "file"]
+    # Scale character and item quotas depending on task profiles
+    if task_type in ("coding", "debugging"):
+        max_context_chars = CODING_CONTEXT_CHARS
+        max_matches = CODING_MATCHES
+    else:
+        max_context_chars = DEFAULT_CONTEXT_CHARS
+        max_matches = DEFAULT_MATCHES
 
-    ordered = ast_matches + other_matches + file_matches
+    # Stable weighted item ranking: Prioritize AST entities while preserving relevance scores
+    scored_matches = []
+    for item in matches:
+        score = item.get("score", 0.0)
+        if item.get("type") in ("function", "method", "class"):
+            score += 2.0
+        scored_matches.append((score, item))
+
+    scored_matches.sort(key=lambda x: x[0], reverse=True)
+    ordered = [x[1] for x in scored_matches]
 
     context_parts = []
     total_chars = 0
     rendered = 0
 
     for item in ordered:
-        if rendered >= MAX_MATCHES:
+        if rendered >= max_matches:
             break
 
         snippet = _render_match(item)
         snippet_len = len(snippet)
 
-        if total_chars + snippet_len > MAX_CONTEXT_CHARS:
-            # Try to fit a truncated version for file fallbacks
+        if total_chars + snippet_len > max_context_chars:
             if item.get("type") == "file":
-                remaining = MAX_CONTEXT_CHARS - total_chars - 60
+                remaining = max_context_chars - total_chars - 60
                 if remaining > 100:
                     short = _render_match({**item, "content": item.get("content", "")[:remaining]})
                     context_parts.append(short)
