@@ -50,16 +50,6 @@ PKG_ALIASES = {
     "usb":     "pyusb",
 }
 
-TOOL_ALIASES = {
-    "file_read": "read_file",
-    "read": "read_file",
-    "cat": "read_file",
-    "open_file": "read_file",
-    "file_list": "list_files",
-    "ls": "list_files",
-    "grep": "search_files",
-}
-
 _PIP_COMMAND_PATTERN = re.compile(r"^\s*pip\s+install", re.IGNORECASE)
 
 # Global session loops and installation limits
@@ -413,9 +403,7 @@ def main(session):
             task = classify_task(user_input)
             console.print(f"[yellow]Task: {task}[/yellow]")
 
-            auto_context = []
-            if task.get('needs_retrieval', True):
-                auto_context = search_index(session, user_input)
+            auto_context = search_index(session, user_input)
             full_context = None
             if auto_context:
                 full_context = build_context(auto_context)
@@ -475,11 +463,7 @@ def main(session):
             # Stateful Verification Tracking Switches
             runtime_verified = False
             last_tool_metadata = None
-            last_tools_executed = []
-            last_tools_failed = False
             task_completed = False
-            last_successful_tool_sig = None
-            last_successful_tool_result_str = ""
 
             while passes < max_passes and tool_loops < max_tool_loops:
                 prompt_size  = sum(len(m.get("content", "")) for m in worker_history)
@@ -658,358 +642,343 @@ def main(session):
                     metrics.record_retry()
                     continue
 
-                if parsed_response:
-                    parsed_responses = parsed_response if isinstance(parsed_response, list) else [parsed_response]
-                    has_tool_call = any(isinstance(pr, dict) and pr.get('type') == 'tool_call' for pr in parsed_responses)
-                    if has_tool_call:
-                        worker_history.append({'role': 'assistant', 'content': raw_response})
-                        last_tools_executed = []
-                    batch_results = []
-                    any_failed = False
-                    for pr in parsed_responses:
-                        if not isinstance(pr, dict): continue
-                        parsed_response = pr
-                        resp_type = parsed_response.get('type')
+                if parsed_response and isinstance(parsed_response, dict):
+                    resp_type = parsed_response.get("type")
 
+                    if resp_type == "tool_call" and tool_loops < max_tool_loops:
+                        metrics.tool_calls += 1
+                        tool_name = parsed_response.get("tool")
+                        args      = parsed_response.get("args", {})
+                        console.print("\n[magenta]Tool Call:[/magenta] ", end="")
+                        console.print(f"{tool_name}({args})", markup=False, highlight=False)
+                        session.log(f"TOOL: {tool_name}({args})")
 
-                        if resp_type == "tool_call" and tool_loops < max_tool_loops:
-                            metrics.tool_calls += 1
-                            raw_tool_name = parsed_response.get("tool")
-                            tool_name = TOOL_ALIASES.get(raw_tool_name, raw_tool_name)
-                            last_tools_executed.append(tool_name)
-                            args      = parsed_response.get("args", {})
-                            console.print("\n[magenta]Tool Call:[/magenta] ", end="")
-                            console.print(f"{tool_name}({args})", markup=False, highlight=False)
-                            session.log(f"TOOL: {tool_name}({args})")
-
-                            # Signature Loop Guard Check
-                            sig_key = (tool_name, json.dumps(args, sort_keys=True))
-                            
-                            if sig_key == last_successful_tool_sig:
-                                console.print(f"[yellow]Skipping duplicate successful tool call: {tool_name}[/yellow]")
-                                batch_results.append(f'TOOL RESULT (CACHED):\n{last_successful_tool_result_str}\n\nCRITICAL INSTRUCTION: You already called this tool successfully. Produce the final answer NOW. Do not call this tool again.')
-                                continue
-                                
-                            tool_signatures_counter[sig_key] += 1
+                        # Signature Loop Guard Check
+                        sig_key = (tool_name, json.dumps(args, sort_keys=True))
+                        tool_signatures_counter[sig_key] += 1
                         
-                            if tool_signatures_counter[sig_key] >= 3:
-                                console.print(f"[bold red]CRITICAL: Infinite loop flagged for tool '{tool_name}'![/bold red]")
-                                response_content = f"Execution halted: Duplicate processing loop detected inside tool execution call."
-                                break
+                        if tool_signatures_counter[sig_key] >= 3:
+                            console.print(f"[bold red]CRITICAL: Infinite loop flagged for tool '{tool_name}'![/bold red]")
+                            response_content = f"Execution halted: Duplicate processing loop detected inside tool execution call."
+                            break
 
-                            tool_result_dict = {"success": True, "tool": tool_name, "stdout": "", "stderr": ""}
-                            raw_path = args.get("path")
-                            norm_path = normalize_path(raw_path)
+                        tool_result_dict = {"success": True, "tool": tool_name, "stdout": "", "stderr": ""}
+                        raw_path = args.get("path")
+                        norm_path = normalize_path(raw_path)
 
-                            try:
-                                if tool_name == "read_file":
-                                    res = read_file(raw_path)
-                                    if str(res).startswith("Error:"):
-                                        tool_result_dict["success"] = False
-                                        tool_result_dict["stderr"] = res
-                                    else:
-                                        tool_result_dict["stdout"] = res
+                        try:
+                            if tool_name == "read_file":
+                                res = read_file(raw_path)
+                                if str(res).startswith("Error:"):
+                                    tool_result_dict["success"] = False
+                                    tool_result_dict["stderr"] = res
+                                else:
+                                    tool_result_dict["stdout"] = res
 
-                                elif tool_name == "write_file" and not task_completed:
-                                    new_content = args.get("content", "").strip()
-                                    if new_content.startswith("```"):
-                                        lines = new_content.splitlines()[1:]
-                                        if lines and lines[-1].strip() == "```":
-                                            lines = lines[:-1]
-                                        new_content = "\n".join(lines)
+                            elif tool_name == "write_file" and not task_completed:
+                                new_content = args.get("content", "").strip()
+                                if new_content.startswith("```"):
+                                    lines = new_content.splitlines()[1:]
+                                    if lines and lines[-1].strip() == "```":
+                                        lines = lines[:-1]
+                                    new_content = "\n".join(lines)
                                 
-                                    content_hash = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+                                content_hash = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+                                file_content_sig = (norm_path, content_hash)
+                                
+                                if file_content_sig in content_signatures:
+                                    print("REDUNDANT WRITE DETECTED:", norm_path)
+                                    tool_result_dict["success"] = False
+                                    tool_result_dict["stderr"] = f"Error: Redundant write payload. This content signature is already present on disk."
+                                else:
+                                    write_result = write_file(raw_path, new_content)
+                                    if str(write_result).startswith("Error:"):
+                                        tool_result_dict["success"] = False
+                                        tool_result_dict["stderr"] = write_result
+                                    else:
+                                        content_signatures.add(file_content_sig)
+                                        tool_result_dict["stdout"] = str(write_result)
+                                        
+                                        # ATOMIC REGISTRATION (Recorded instantly on disk write confirm)
+                                        if norm_path:
+                                            _written_files.add(norm_path)
+                                        
+                                        # Stateful High-Fidelity Verification Escape Check
+                                        if expected_files and expected_files.issubset(_written_files):
+                                            if not has_validation_commands or runtime_verified:
+                                                console.print("[bold green]TASK COMPLETE VIA IMMEDIATE ESCAPE[/bold green]")
+                                                response_content = "All required files created and verified successfully."
+                                                task_completed = True
+                                                break
+                                            
+                                        try:
+                                            update_file_index(session, raw_path)
+                                        except Exception as e:
+                                            logger.warning(f"Index update skipped/failed for raw target {raw_path}: {e}")
+
+                            elif tool_name == "replace_chunk":
+                                target  = args.get("target_code", "")
+                                replace = args.get("replacement_code", "").strip()
+                                if replace.startswith("```"):
+                                    lines = replace.splitlines()[1:]
+                                    if lines and lines[-1].strip() == "```":
+                                        lines = lines[:-1]
+                                    replace = "\n".join(lines)
+                                
+                                content = read_file(raw_path)
+                                if str(content).startswith("Error:"):
+                                    tool_result_dict["success"] = False
+                                    tool_result_dict["stderr"] = content
+                                elif target in content:
+                                    updated_content = content.replace(target, replace)
+                                    
+                                    content_hash = hashlib.sha256(updated_content.encode("utf-8")).hexdigest()
                                     file_content_sig = (norm_path, content_hash)
-                                
+                                    
                                     if file_content_sig in content_signatures:
-                                        print("REDUNDANT WRITE DETECTED:", norm_path)
                                         tool_result_dict["success"] = False
-                                        tool_result_dict["stderr"] = f"Error: Redundant write payload. This content signature is already present on disk."
+                                        tool_result_dict["stderr"] = f"Error: Redundant chunk adjustment mutation. This resulting file configuration is already on disk."
                                     else:
-                                        write_result = write_file(raw_path, new_content)
-                                        if str(write_result).startswith("Error:"):
-                                            tool_result_dict["success"] = False
-                                            tool_result_dict["stderr"] = write_result
-                                        else:
-                                            content_signatures.add(file_content_sig)
-                                            tool_result_dict["stdout"] = str(write_result)
+                                        write_file(raw_path, updated_content)
+                                        content_signatures.add(file_content_sig)
+                                        tool_result_dict["stdout"] = "Chunk replaced successfully."
                                         
-                                            # ATOMIC REGISTRATION (Recorded instantly on disk write confirm)
-                                            if norm_path:
-                                                _written_files.add(norm_path)
-                                        
-                                            # Stateful High-Fidelity Verification Escape Check
-                                            if expected_files and expected_files.issubset(_written_files):
-                                                if not has_validation_commands or runtime_verified:
-                                                    console.print("[bold green]TASK COMPLETE VIA IMMEDIATE ESCAPE[/bold green]")
-                                                    response_content = "All required files created and verified successfully."
-                                                    task_completed = True
-                                                    break
+                                        if norm_path:
+                                            _written_files.add(norm_path)
                                             
-                                            try:
-                                                update_file_index(session, raw_path)
-                                            except Exception as e:
-                                                logger.warning(f"Index update skipped/failed for raw target {raw_path}: {e}")
-
-                                elif tool_name == "replace_chunk":
-                                    target  = args.get("target_code", "")
-                                    replace = args.get("replacement_code", "").strip()
-                                    if replace.startswith("```"):
-                                        lines = replace.splitlines()[1:]
-                                        if lines and lines[-1].strip() == "```":
-                                            lines = lines[:-1]
-                                        replace = "\n".join(lines)
-                                
-                                    content = read_file(raw_path)
-                                    if str(content).startswith("Error:"):
-                                        tool_result_dict["success"] = False
-                                        tool_result_dict["stderr"] = content
-                                    elif target in content:
-                                        updated_content = content.replace(target, replace)
-                                    
-                                        content_hash = hashlib.sha256(updated_content.encode("utf-8")).hexdigest()
-                                        file_content_sig = (norm_path, content_hash)
-                                    
-                                        if file_content_sig in content_signatures:
-                                            tool_result_dict["success"] = False
-                                            tool_result_dict["stderr"] = f"Error: Redundant chunk adjustment mutation. This resulting file configuration is already on disk."
-                                        else:
-                                            write_file(raw_path, updated_content)
-                                            content_signatures.add(file_content_sig)
-                                            tool_result_dict["stdout"] = "Chunk replaced successfully."
-                                        
-                                            if norm_path:
-                                                _written_files.add(norm_path)
+                                        if expected_files and expected_files.issubset(_written_files):
+                                            if not has_validation_commands or runtime_verified:
+                                                console.print("[bold green]TASK COMPLETE VIA IMMEDIATE ESCAPE[/bold green]")
+                                                response_content = "All required files created and verified successfully."
+                                                task_completed = True
+                                                break
                                             
-                                            if expected_files and expected_files.issubset(_written_files):
-                                                if not has_validation_commands or runtime_verified:
-                                                    console.print("[bold green]TASK COMPLETE VIA IMMEDIATE ESCAPE[/bold green]")
-                                                    response_content = "All required files created and verified successfully."
-                                                    task_completed = True
-                                                    break
-                                            
-                                            try:
-                                                update_file_index(session, raw_path)
-                                            except Exception as e:
-                                                logger.warning(f"Index update failed for raw target {raw_path}: {e}")
-                                    else:
-                                        tool_result_dict["success"] = False
-                                        tool_result_dict["stderr"] = "Error: target_code not found in file."
-
-                                elif tool_name == "list_files":
-                                    tool_result_dict["stdout"] = list_files()
-
-                                elif tool_name == "search_index":
-                                    tool_result_dict["stdout"] = str(search_index(session, args.get("query")))
-
-                                elif tool_name == "install_package":
-                                    pkg = args.get("package", "").strip()
-                                    if not pkg:
-                                        tool_result_dict["success"] = False
-                                        tool_result_dict["stderr"] = "Error: No package name provided."
-                                    else:
-                                        pip_pkg = _pip_name(pkg)
-                                        if INSTALL_ATTEMPTS[pip_pkg] >= MAX_INSTALL_ATTEMPTS:
-                                            tool_result_dict["success"] = False
-                                            tool_result_dict["stderr"] = f"INSTALL LOCKOUT: Installation attempts for '{pip_pkg}' are forbidden."
-                                        else:
-                                            INSTALL_ATTEMPTS[pip_pkg] += 1
-                                            confirm = input(f"Run 'pip install {pip_pkg}'? (y/n): ").lower()
-                                            if confirm == "y":
-                                                proc = subprocess.run(
-                                                    ["pip", "install", "--only-binary", ":all:", pip_pkg],
-                                                    capture_output=True, text=True
-                                                )
-                                                if proc.returncode == 0:
-                                                    out = (proc.stdout or "").strip()[-300:]
-                                                    console.print(f"[green]pip install {pip_pkg} done.[/green]")
-                                                    tool_result_dict["stdout"] = out or "Installed successfully."
-                                                else:
-                                                    proc2 = subprocess.run(["pip", "install", pip_pkg], capture_output=True, text=True)
-                                                    out2 = (proc2.stdout or proc2.stderr or "").strip()[-400:]
-                                                    if proc2.returncode == 0:
-                                                        tool_result_dict["stdout"] = out2 or "Installed."
-                                                    else:
-                                                        tool_result_dict["success"] = False
-                                                        tool_result_dict["stderr"] = (
-                                                            f"Error: pip install {pip_pkg} failed.\n{out2}\n"
-                                                            "CRITICAL AGENT NOTE: Installation failed. Do NOT attempt to run install again."
-                                                        )
-                                            else:
-                                                tool_result_dict["success"] = False
-                                                tool_result_dict["stderr"] = f"Install of '{pip_pkg}' aborted by user."
-
-                                elif tool_name == "run_command":
-                                    cmd = args.get("command", "").strip()
-                                
-                                    READ_ONLY_COMMANDS = ("git status", "git diff")
-                                    BUILD_TEST_COMMANDS = ("python ", "python3 ", "pytest ")
-                                    ALLOWED_INSTALLS = ("pip ",)
-                                    SERVER_FRAMEWORK_KEYWORDS = ["flask", "fastapi", "uvicorn", "streamlit", "app.py"]
-                                
-                                    is_readable = any(cmd.startswith(p) for p in READ_ONLY_COMMANDS)
-                                    is_buildable = any(cmd.startswith(p) for p in BUILD_TEST_COMMANDS)
-                                    is_installable = any(cmd.startswith(p) for p in ALLOWED_INSTALLS)
-                                    is_server_process = any(keyword in cmd.lower() for keyword in SERVER_FRAMEWORK_KEYWORDS)
-                                
-                                    if not (is_readable or is_buildable or is_installable):
-                                        tool_result_dict["success"] = False
-                                        tool_result_dict["stderr"] = f"Error: Command '{cmd}' rejected. Security policy violations."
-                                    else:
-                                        confirm = "y" if is_readable else input(f"Execute '{cmd}'? (y/n): ").lower()
-                                        if confirm == "y":
-                                            # Non-blocking Validation Management via Popen() Strategy
-                                            if is_server_process and is_buildable:
-                                                console.print("[yellow]Long-running process / web-server detected. Applying Popen observation...[/yellow]")
-                                                try:
-                                                    print("BEFORE RUN (SERVER POPEN SAFE-GUARD)")
-                                                    proc = subprocess.Popen(
-                                                        cmd, shell=True,
-                                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                                        text=True, cwd=session.root
-                                                    )
-                                                    # Allow the process tree to stabilize for evaluation
-                                                    time.sleep(6)
-                                                
-                                                    # Check if process is still running cleanly without exiting
-                                                    if proc.poll() is None:
-                                                        print("AFTER RUN (OBSERVATION WINDOW STABLE)")
-                                                        console.print("[green]State Machine Update: Background server successfully launched and remains active.[/green]")
-                                                        tool_result_dict["success"] = True
-                                                        tool_result_dict["stdout"] = "Application successfully started and maintained stability during observation."
-                                                        runtime_verified = True
-                                                    
-                                                        # Graceful closure of verification process
-                                                        proc.terminate()
-                                                        proc.wait(timeout=3)
-                                                    else:
-                                                        # Process crashed prematurely within the observation window
-                                                        stdout, stderr = proc.communicate()
-                                                        tool_result_dict["success"] = False
-                                                        tool_result_dict["stderr"] = f"Process terminated prematurely during tracking.\nStdout:\n{stdout}\nStderr:\n{stderr}"
-                                                except Exception as e:
-                                                    print("SERVER RUN ERROR:", repr(e))
-                                                    tool_result_dict["success"] = False
-                                                    tool_result_dict["stderr"] = f"Server failed to launch cleanly: {e}"
-                                            else:
-                                                print("BEFORE RUN")
-                                                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=session.root)
-                                                print("AFTER RUN")
-                                                out = proc.stdout[-1000:] if proc.stdout else ""
-                                                err = proc.stderr[-1000:] if proc.stderr else ""
-                                                if proc.stdout and len(proc.stdout) > 1000: out = "...[TRUNCATED]\n" + out
-                                                if proc.stderr and len(proc.stderr) > 1000: err = "...[TRUNCATED]\n" + err
-                                            
-                                                tool_result_dict["success"] = (proc.returncode == 0)
-                                                tool_result_dict["stdout"] = out
-                                                tool_result_dict["stderr"] = f"Exit code {proc.returncode}\n{err}"
-                                            
-                                                if proc.returncode == 0 and not is_readable:
-                                                    runtime_verified = True
-                                                    console.print("[green]State Machine Update: Execution/Verification command succeeded (exit code 0).[/green]")
-                                        
-                                            tool_result_dict = _try_auto_install(cmd, tool_result_dict)
-                                        else:
-                                            tool_result_dict["success"] = False
-                                            tool_result_dict["stderr"] = "Command aborted by user."
-                                elif tool_name in ("print_message", "print_statement"):
-                                    msg = args.get("message", args.get("statement", args.get("text", "")))
-                                    console.print(f"[bold green]Message:[/bold green] {msg}")
-                                    response_content = msg
-                                    task_completed = True
-                                    break
+                                        try:
+                                            update_file_index(session, raw_path)
+                                        except Exception as e:
+                                            logger.warning(f"Index update failed for raw target {raw_path}: {e}")
                                 else:
                                     tool_result_dict["success"] = False
-                                    tool_result_dict["stderr"] = f"Error: Unknown tool '{tool_name}'"
+                                    tool_result_dict["stderr"] = "Error: target_code not found in file."
 
-                            except Exception as e:
-                                tool_result_dict["success"] = False
-                                tool_result_dict["stderr"] = f"Tool Execution Error: {e}"
+                            elif tool_name == "list_files":
+                                tool_result_dict["stdout"] = list_files()
 
-                            last_tool_metadata = {
-                                "tool": tool_name,
-                                "success": tool_result_dict["success"],
-                                "path": raw_path if raw_path else args.get("command", "")
-                            }
+                            elif tool_name == "search_index":
+                                tool_result_dict["stdout"] = str(search_index(session, args.get("query")))
 
-                            combined_result_str = json.dumps(tool_result_dict, indent=2)
-                            console.print(f"[dim]Tool Result: {len(combined_result_str)} chars[/dim]")
-
-                            # ── Multi-Tier Checklist Evaluation Gate ──
-                            if tool_name in ("write_file", "replace_chunk", "run_command"):
-                                print("DEBUG:", tool_name, "success=", tool_result_dict["success"], "path=", norm_path)
-                                print("RAW PATH:", raw_path if raw_path else args.get("command", ""))
-                                print("NORMALIZED:", repr(norm_path))
-                            
-                                files_complete = expected_files.issubset(_written_files)
-                            
-                                print("EXPECTED ARTIFACTS:", sorted(list(expected_files)))
-                                print("WRITTEN ARTIFACTS :", sorted(list(_written_files)))
-                                print("FILES COMPLETE    :", files_complete)
-                                print("RUNTIME VERIFIED  :", runtime_verified)
-
-                                if expected_files:
-                                    if files_complete and (not has_validation_commands or runtime_verified):
-                                        console.print("[bold green]TASK COMPLETE: Blueprints generated and runtime behavior verified.[/bold green]")
-                                        response_content = "All required application components created and script verifications executed successfully."
-                                        task_completed = True
-                                        break
+                            elif tool_name == "install_package":
+                                pkg = args.get("package", "").strip()
+                                if not pkg:
+                                    tool_result_dict["success"] = False
+                                    tool_result_dict["stderr"] = "Error: No package name provided."
                                 else:
-                                    multi_file_heuristic = (
-                                        " and " in user_input.lower()
-                                        or "multiple" in user_input.lower()
-                                        or "templates/" in user_input.lower()
-                                    )
-                                    if not multi_file_heuristic and tool_result_dict["success"]:
-                                        if not has_validation_commands or runtime_verified:
-                                            console.print("[bold green]TASK COMPLETE: Solitary blueprint execution complete.[/bold green]")
-                                            response_content = "Solitary blueprint architecture modification and verification passed successfully."
-                                            task_completed = True
-                                            break
+                                    pip_pkg = _pip_name(pkg)
+                                    if INSTALL_ATTEMPTS[pip_pkg] >= MAX_INSTALL_ATTEMPTS:
+                                        tool_result_dict["success"] = False
+                                        tool_result_dict["stderr"] = f"INSTALL LOCKOUT: Installation attempts for '{pip_pkg}' are forbidden."
+                                    else:
+                                        INSTALL_ATTEMPTS[pip_pkg] += 1
+                                        confirm = input(f"Run 'pip install {pip_pkg}'? (y/n): ").lower()
+                                        if confirm == "y":
+                                            proc = subprocess.run(
+                                                ["pip", "install", "--only-binary", ":all:", pip_pkg],
+                                                capture_output=True, text=True
+                                            )
+                                            if proc.returncode == 0:
+                                                out = (proc.stdout or "").strip()[-300:]
+                                                console.print(f"[green]pip install {pip_pkg} done.[/green]")
+                                                tool_result_dict["stdout"] = out or "Installed successfully."
+                                            else:
+                                                proc2 = subprocess.run(["pip", "install", pip_pkg], capture_output=True, text=True)
+                                                out2 = (proc2.stdout or proc2.stderr or "").strip()[-400:]
+                                                if proc2.returncode == 0:
+                                                    tool_result_dict["stdout"] = out2 or "Installed."
+                                                else:
+                                                    tool_result_dict["success"] = False
+                                                    tool_result_dict["stderr"] = (
+                                                        f"Error: pip install {pip_pkg} failed.\n{out2}\n"
+                                                        "CRITICAL AGENT NOTE: Installation failed. Do NOT attempt to run install again."
+                                                    )
+                                        else:
+                                            tool_result_dict["success"] = False
+                                            tool_result_dict["stderr"] = f"Install of '{pip_pkg}' aborted by user."
 
-                                # ── Hard Runaway Loop Guard ──
-                                if tool_name in ("write_file", "replace_chunk") and tool_result_dict["success"]:
-                                    duplicate_count[norm_path] += 1
-                                    if duplicate_count[norm_path] >= 2:
-                                        console.print(f"[red]Duplicate artifact loop detected: {norm_path}[/red]")
-                                        response_content = f"Created artifact {norm_path}. Stopped due to duplicate write loop."
+                            elif tool_name == "run_command":
+                                cmd = args.get("command", "").strip()
+                                
+                                READ_ONLY_COMMANDS = ("git status", "git diff")
+                                BUILD_TEST_COMMANDS = ("python ", "python3 ", "pytest ")
+                                ALLOWED_INSTALLS = ("pip ",)
+                                SERVER_FRAMEWORK_KEYWORDS = ["flask", "fastapi", "uvicorn", "streamlit", "app.py"]
+                                
+                                is_readable = any(cmd.startswith(p) for p in READ_ONLY_COMMANDS)
+                                is_buildable = any(cmd.startswith(p) for p in BUILD_TEST_COMMANDS)
+                                is_installable = any(cmd.startswith(p) for p in ALLOWED_INSTALLS)
+                                is_server_process = any(keyword in cmd.lower() for keyword in SERVER_FRAMEWORK_KEYWORDS)
+                                
+                                if not (is_readable or is_buildable or is_installable):
+                                    tool_result_dict["success"] = False
+                                    tool_result_dict["stderr"] = f"Error: Command '{cmd}' rejected. Security policy violations."
+                                else:
+                                    confirm = "y" if is_readable else input(f"Execute '{cmd}'? (y/n): ").lower()
+                                    if confirm == "y":
+                                        # Non-blocking Validation Management via Popen() Strategy
+                                        if is_server_process and is_buildable:
+                                            console.print("[yellow]Long-running process / web-server detected. Applying Popen observation...[/yellow]")
+                                            try:
+                                                print("BEFORE RUN (SERVER POPEN SAFE-GUARD)")
+                                                proc = subprocess.Popen(
+                                                    cmd, shell=True,
+                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                    text=True, cwd=session.root
+                                                )
+                                                # Allow the process tree to stabilize for evaluation
+                                                time.sleep(6)
+                                                
+                                                # Check if process is still running cleanly without exiting
+                                                if proc.poll() is None:
+                                                    print("AFTER RUN (OBSERVATION WINDOW STABLE)")
+                                                    console.print("[green]State Machine Update: Background server successfully launched and remains active.[/green]")
+                                                    tool_result_dict["success"] = True
+                                                    tool_result_dict["stdout"] = "Application successfully started and maintained stability during observation."
+                                                    runtime_verified = True
+                                                    
+                                                    # Graceful closure of verification process
+                                                    proc.terminate()
+                                                    proc.wait(timeout=3)
+                                                else:
+                                                    # Process crashed prematurely within the observation window
+                                                    stdout, stderr = proc.communicate()
+                                                    tool_result_dict["success"] = False
+                                                    tool_result_dict["stderr"] = f"Process terminated prematurely during tracking.\nStdout:\n{stdout}\nStderr:\n{stderr}"
+                                            except Exception as e:
+                                                print("SERVER RUN ERROR:", repr(e))
+                                                tool_result_dict["success"] = False
+                                                tool_result_dict["stderr"] = f"Server failed to launch cleanly: {e}"
+                                        else:
+                                            print("BEFORE RUN")
+                                            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=session.root)
+                                            print("AFTER RUN")
+                                            out = proc.stdout[-1000:] if proc.stdout else ""
+                                            err = proc.stderr[-1000:] if proc.stderr else ""
+                                            if proc.stdout and len(proc.stdout) > 1000: out = "...[TRUNCATED]\n" + out
+                                            if proc.stderr and len(proc.stderr) > 1000: err = "...[TRUNCATED]\n" + err
+                                            
+                                            tool_result_dict["success"] = (proc.returncode == 0)
+                                            tool_result_dict["stdout"] = out
+                                            tool_result_dict["stderr"] = f"Exit code {proc.returncode}\n{err}"
+                                            
+                                            if proc.returncode == 0 and not is_readable:
+                                                runtime_verified = True
+                                                console.print("[green]State Machine Update: Execution/Verification command succeeded (exit code 0).[/green]")
+                                        
+                                        tool_result_dict = _try_auto_install(cmd, tool_result_dict)
+                                    else:
+                                        tool_result_dict["success"] = False
+                                        tool_result_dict["stderr"] = "Command aborted by user."
+                            elif tool_name in ("print_message", "print_statement"):
+                                msg = args.get("message", args.get("statement", args.get("text", "")))
+                                console.print(f"[bold green]Message:[/bold green] {msg}")
+                                response_content = msg
+                                task_completed = True
+                                break
+                            else:
+                                tool_result_dict["success"] = False
+                                tool_result_dict["stderr"] = f"Error: Unknown tool '{tool_name}'"
+
+                        except Exception as e:
+                            tool_result_dict["success"] = False
+                            tool_result_dict["stderr"] = f"Tool Execution Error: {e}"
+
+                        last_tool_metadata = {
+                            "tool": tool_name,
+                            "success": tool_result_dict["success"],
+                            "path": raw_path if raw_path else args.get("command", "")
+                        }
+
+                        combined_result_str = json.dumps(tool_result_dict, indent=2)
+                        console.print(f"[dim]Tool Result: {len(combined_result_str)} chars[/dim]")
+
+                        # ── Multi-Tier Checklist Evaluation Gate ──
+                        if tool_name in ("write_file", "replace_chunk", "run_command"):
+                            print("DEBUG:", tool_name, "success=", tool_result_dict["success"], "path=", norm_path)
+                            print("RAW PATH:", raw_path if raw_path else args.get("command", ""))
+                            print("NORMALIZED:", repr(norm_path))
+                            
+                            files_complete = expected_files.issubset(_written_files)
+                            
+                            print("EXPECTED ARTIFACTS:", sorted(list(expected_files)))
+                            print("WRITTEN ARTIFACTS :", sorted(list(_written_files)))
+                            print("FILES COMPLETE    :", files_complete)
+                            print("RUNTIME VERIFIED  :", runtime_verified)
+
+                            if expected_files:
+                                if files_complete and (not has_validation_commands or runtime_verified):
+                                    console.print("[bold green]TASK COMPLETE: Blueprints generated and runtime behavior verified.[/bold green]")
+                                    response_content = "All required application components created and script verifications executed successfully."
+                                    task_completed = True
+                                    break
+                            else:
+                                multi_file_heuristic = (
+                                    " and " in user_input.lower()
+                                    or "multiple" in user_input.lower()
+                                    or "templates/" in user_input.lower()
+                                )
+                                if not multi_file_heuristic and tool_result_dict["success"]:
+                                    if not has_validation_commands or runtime_verified:
+                                        console.print("[bold green]TASK COMPLETE: Solitary blueprint execution complete.[/bold green]")
+                                        response_content = "Solitary blueprint architecture modification and verification passed successfully."
                                         task_completed = True
                                         break
-                                        
-                            if tool_result_dict["success"]:
-                                last_successful_tool_sig = sig_key
-                                last_successful_tool_result_str = combined_result_str
-                                
-                                if tool_name == "read_file":
-                                    combined_result_str += "\n\nThe requested file has already been read successfully. Use the provided contents to answer the user. Do NOT call read_file again unless requesting a different file."
 
-                        batch_results.append(f'TOOL RESULT:\n{combined_result_str}')
-                        if not tool_result_dict['success']:
-                            any_failed = True
-                            last_tools_failed = True
+                            # ── Hard Runaway Loop Guard ──
+                            if tool_name in ("write_file", "replace_chunk") and tool_result_dict["success"]:
+                                duplicate_count[norm_path] += 1
+                                if duplicate_count[norm_path] >= 2:
+                                    console.print(f"[red]Duplicate artifact loop detected: {norm_path}[/red]")
+                                    response_content = f"Created artifact {norm_path}. Stopped due to duplicate write loop."
+                                    task_completed = True
+                                    break
 
-                    if batch_results:
-                        if tool_loops >= max_tool_loops - 1:
-                            instruction = "TOOL LOOP LIMIT REACHED. You must now produce the final user-facing answer in plain text. Do NOT emit any more tool calls."
-                        else:
-                            instruction = "Here are the tool results. If you need more information, you may use another tool. Otherwise, produce the final user-facing answer."
-                        
+                        worker_history.append({"role": "assistant", "content": raw_response})
                         worker_history.append({
-                            'role': 'user',
-                            'content': '\n\n'.join(batch_results) + f'\n\n{instruction}'
+                            "role": "user",
+                            "content": (
+                                f"TOOL RESULT:\n{combined_result_str}\n\n"
+                                "CRITICAL INSTRUCTION: When calling a tool, you must output ONLY valid raw JSON starting with '{'. "
+                                "Do NOT explain, do NOT narrate steps, and do NOT write any markdown text outside the JSON block."
+                            )
                         })
-                        if any_failed:
-                            worker_history.append({'role': 'user', 'content': 'Some tool calls failed. Correct and retry.'})
+
+                        if not tool_result_dict["success"]:
+                            worker_history.append({
+                                "role": "user",
+                                "content": (
+                                    "The previous tool call failed. Do NOT explain the error or apologize. "
+                                    "Respond with ONLY a corrected tool_call JSON starting with '{'."
+                                )
+                            })
+
                         tool_loops += 1
                         metrics.record_retry()
                         continue
 
-                    response_items = [pr for pr in parsed_responses if isinstance(pr, dict) and pr.get('type') == 'response']
-                    if response_items:
-                        response_content = ' '.join(pr.get('content', '') for pr in response_items)
-                        console.print() 
-                        console.print(response_content, style='green', markup=False, highlight=False)
-                        worker_history.append({'role': 'assistant', 'content': response_content})
+                    elif resp_type == "response":
+                        response_content = parsed_response.get("content", raw_response)
+                        console.print()
+                        console.print(response_content, style="green", markup=False, highlight=False)
+                    else:
+                        response_content = raw_response
+                        if is_tool:
+                            console.print()
+                            console.print(response_content, style="green", markup=False, highlight=False)
+                else:
+                    response_content = raw_response
+                    if is_tool:
+                        console.print()
+                        console.print(response_content, style="green", markup=False, highlight=False)
+
                 if not response_content or not response_content.strip():
                     response_content = "[empty response from model]"
 
@@ -1017,17 +986,6 @@ def main(session):
                     break
 
                 # ── Critic Bypass Gate ────────────────────────────────────
-                placeholder_phrases = ["i don't know", "i do not know", "i cannot", "need more information", "sorry", "not sure"]
-                has_placeholders = any(p in response_content.lower() for p in placeholder_phrases)
-                
-                simple_tools = {"list_files", "read_file", "search_files", "search_index"}
-                all_simple = last_tools_executed and all(t in simple_tools for t in last_tools_executed)
-                
-                if all_simple and not last_tools_failed and not has_placeholders:
-                    console.print("[dim]Bypassing Critic (successful simple tool operation).[/dim]")
-                    passes += 1
-                    break
-
                 metrics.record_llm_call()
                 critic = critique_response(
                     user_input=user_input,

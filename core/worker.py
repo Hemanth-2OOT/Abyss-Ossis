@@ -20,6 +20,20 @@ Rules:
         num_predict = 4096
         model = EDITOR_MODEL
 
+    # Chat / Explanation mode
+    elif isinstance(task, dict) and task.get("task_type") in ("chat", "explanation"):
+        system_prompt = """
+You are a helpful, conversational AI assistant.
+
+Rules:
+- Respond directly in RAW PLAIN TEXT format.
+- Never output JSON format.
+- Never emit 'tool_call', 'print', 'print_message', or 'print_statement'.
+- Do not attempt to use any tools. Provide your final answer directly to the user.
+"""
+        num_predict = 2048
+        model = WORKER_MODEL
+
     # Normal agent mode
     else:
         num_predict = 4096

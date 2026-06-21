@@ -119,6 +119,14 @@ def classify_task(user_input):
             "needs_tools": True,
             "needs_retrieval": True
         }
+    # Rule 4: File inspection and commands
+    elif any(w in text for w in ["list files", "read files", "show directory", "open file", "ls", "cat"]):
+        task = {
+            "task_type": "file_analysis",
+            "needs_planner": False,
+            "needs_tools": True,
+            "needs_retrieval": False
+        }
     # Fallback to LLM classifier if words are completely ambiguous
     else:
         task = classify_task_llm(user_input)
