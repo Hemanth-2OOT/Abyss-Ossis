@@ -16,7 +16,18 @@ class WorkspaceSandbox:
         ]
 
     def get_safe_path(self, path):
-        abs_path = os.path.abspath(os.path.realpath(path))
+        # Anchor relative paths to the workspace root, not the process's CWD.
+        # Without this, a relative path like "hello.py" resolves against
+        # os.getcwd() (wherever the agent was launched from), not the user's
+        # project workspace — causing every relative-path write/read to be
+        # rejected as "outside the allowed workspace" even when it's exactly
+        # where the user wants it.
+        if os.path.isabs(path):
+            candidate = path
+        else:
+            candidate = os.path.join(self.workspace_root, path)
+
+        abs_path = os.path.abspath(os.path.realpath(candidate))
         # Check against workspace root
         try:
             if os.path.commonpath([abs_path, self.workspace_root]) == self.workspace_root:

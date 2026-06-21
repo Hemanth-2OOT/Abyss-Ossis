@@ -5,10 +5,17 @@ from core.logger import get_logger
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 TIMEOUT_SECONDS = 120
 
+# Hard cap on generated tokens per call. Without this, a model that starts
+# generating runaway <think> reasoning (or just rambling) has no upper bound
+# and can run for many minutes while pinning CPU/GPU, with no error surfaced
+# to the user — the streaming connection stays "alive" the whole time so
+# TIMEOUT_SECONDS never fires.
+DEFAULT_NUM_PREDICT = 2048
+
 logger = get_logger(__name__)
 
 
-def chat_ollama(messages, model=None, temperature=None, stream=False):
+def chat_ollama(messages, model=None, temperature=None, stream=False, num_predict=None):
     """
     Send a chat request to the local Ollama instance.
 
@@ -19,8 +26,13 @@ def chat_ollama(messages, model=None, temperature=None, stream=False):
         "model": model or MODEL,
         "messages": messages,
         "stream": stream,
+        # Disable hidden reasoning/<think> blocks for models that support it
+        # (e.g. qwen3). Ollama ignores this option for models that don't
+        # support thinking mode, so it's safe to always include.
+        "think": False,
         "options": {
-            "temperature": temperature if temperature is not None else 0.2
+            "temperature": temperature if temperature is not None else 0.2,
+            "num_predict": num_predict if num_predict is not None else DEFAULT_NUM_PREDICT
         }
     }
 

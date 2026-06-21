@@ -7,6 +7,30 @@ logger = get_logger(__name__)
 
 IGNORE_DIRS = {"venv", "__pycache__", ".git", ".agents"}
 
+# Agent-internal metadata files must never be indexed. Logs in particular
+# accumulate repeated keywords (USER:, TOOL:, AGENT:, every filename ever
+# mentioned) which inflates keyword-overlap and embedding-similarity scores,
+# causing them to outrank real source files in search/retrieval results.
+IGNORE_FILES = {
+    ".localagent.logs.txt",
+    ".localagent.index.json",
+    ".localagent.memory.json",
+    "faiss_index.bin",
+}
+IGNORE_FILE_PREFIXES = (".localagent.",)
+IGNORE_FILE_EXTENSIONS = {".bak", ".bin"}
+
+
+def _should_ignore_file(filename):
+    if filename in IGNORE_FILES:
+        return True
+    if filename.startswith(IGNORE_FILE_PREFIXES):
+        return True
+    _, ext = os.path.splitext(filename)
+    if ext in IGNORE_FILE_EXTENSIONS:
+        return True
+    return False
+
 class IndexVisitor(ast.NodeVisitor):
     def __init__(self, filename, source_lines):
         self.filename = filename
@@ -124,6 +148,9 @@ def build_index(root="."):
         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
 
         for file in files:
+            if _should_ignore_file(file):
+                continue
+
             path = os.path.join(current_root, file)
             rel_path = os.path.relpath(path, safe_root).replace("\\", "/")
 
@@ -164,7 +191,10 @@ def index_single_file(path, root="."):
 
     if not os.path.exists(safe_path) or not os.path.isfile(safe_path):
         return index
-        
+
+    if _should_ignore_file(os.path.basename(safe_path)):
+        return index
+
     rel_path = os.path.relpath(safe_path, safe_root).replace("\\", "/")
     
     try:

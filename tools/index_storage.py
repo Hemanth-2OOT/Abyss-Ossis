@@ -131,8 +131,7 @@ def search_index(session, query):
         generate_entity_id
     )
 
-    semantic_matches = search_semantic(query, top_k=3)
-
+    semantic_matches = search_semantic(index, query, top_k=3)
     merged = ast_matches.copy()
 
     seen_ids = {
