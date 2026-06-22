@@ -1,5 +1,6 @@
 import os
 from core.sandbox import sandbox
+from core.tool_result import ToolResult
 from core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -46,7 +47,12 @@ def list_files(path=".", extensions=None):
                 rel_path = os.path.relpath(full_path, safe_path)
                 files.append(rel_path.replace("\\", "/"))
 
-        return "\n".join(sorted(files))
+        result_text = "\n".join(sorted(files))
+        return ToolResult(
+            success=True, 
+            stdout=result_text,
+            summary=f"Listed {len(files)} files."
+        )
     except Exception as e:
         logger.error(f"Failed to list directory {path}: {e}")
-        return f"Error: {e}"
+        return ToolResult(success=False, stdout="", stderr=f"Error: {e}")

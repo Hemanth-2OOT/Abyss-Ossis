@@ -27,7 +27,7 @@ class TestE2EOrchestration(unittest.TestCase):
             patch("cli.search_index", return_value=[]),
             patch("cli.classify_task", return_value={"task_type": "coding", "needs_planner": True, "needs_tools": True, "needs_retrieval": False}),
             patch("core.planner.generate_plan", return_value={"steps": [], "constraints": [], "edge_cases": []}),
-            patch("core.worker.run_worker"),
+            patch("cli.run_worker"),
             patch("cli.critique_response"),
             patch("core.resource_monitor.Watchdog.start")
         ]
@@ -176,7 +176,7 @@ class TestE2EOrchestration(unittest.TestCase):
         cli.main(self.session)
         
         messages_text = str(self.mock_worker.call_args_list)
-        self.assertIn("Tool Result", messages_text) # Should successfully extract the JSON
+        self.assertIn("TOOL RESULT", messages_text) # Should successfully extract the JSON
 
     @patch("builtins.input", side_effect=["Adversarial test 3", KeyboardInterrupt()])
     def test_adversarial_invalid_tool_name(self, mock_input):
@@ -188,7 +188,8 @@ class TestE2EOrchestration(unittest.TestCase):
         cli.main(self.session)
         
         messages_text = str(self.mock_worker.call_args_list)
-        self.assertIn("Unknown tool 'make_coffee'", messages_text)
+        self.assertIn("Unknown tool", messages_text)
+        self.assertIn("make_coffee", messages_text)
 
         # Test memory safety system
     @patch("builtins.input", side_effect=["Do something", KeyboardInterrupt()])

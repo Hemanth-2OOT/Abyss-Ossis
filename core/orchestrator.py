@@ -57,11 +57,11 @@ def classify_task_llm(user_input):
     system_prompt = """
 You are an orchestration router agent.
 Analyze the user's request and classify it into one of these types:
-- coding, debugging, explanation, lookup, chat, file_analysis
+- coding, debugging, explanation, lookup, chat, file_analysis, execute
 
 Output strictly in JSON format with no markdown wrappers:
 {
-  "task_type": "coding" | "debugging" | "explanation" | "lookup" | "chat" | "file_analysis",
+  "task_type": "coding" | "debugging" | "explanation" | "lookup" | "chat" | "file_analysis" | "execute",
   "needs_planner": true | false,
   "needs_tools": true | false,
   "needs_retrieval": true | false
@@ -91,7 +91,9 @@ def classify_task(user_input):
     text = user_input.lower()
     score = complexity_score(user_input)
 
-    coding_words = ["build", "create", "write", "make", "implement", "code", "generate"]
+    coding_words = ["build", "create", "write", "make", "implement", "code", "generate",
+                    "improve", "update", "edit", "enhance", "redesign", "rewrite",
+                    "change", "add", "modify", "extend", "upgrade"]
     debug_words = ["bug", "fix", "error", "traceback", "failing", "crash", "broken"]
     analysis_words = ["architecture", "layout", "structure", "explain how", "fit together"]
 
@@ -123,6 +125,14 @@ def classify_task(user_input):
     elif any(w in text for w in ["list files", "read files", "show directory", "open file", "ls", "cat"]):
         task = {
             "task_type": "file_analysis",
+            "needs_planner": False,
+            "needs_tools": True,
+            "needs_retrieval": False
+        }
+    # Rule 5: Execution commands
+    elif any(w in text for w in ["run", "execute", "start", "launch", "serve", "test"]):
+        task = {
+            "task_type": "execute",
             "needs_planner": False,
             "needs_tools": True,
             "needs_retrieval": False

@@ -2,9 +2,18 @@ from systems.ollama_client import chat_ollama
 from config import WORKER_MODEL, EDITOR_MODEL
 
 
-def run_worker(session, task, messages, context=None, stream=False):
-    # Editing mode
-    if isinstance(task, dict) and task.get("task_type") == "editing":
+def run_worker(session, task, messages, context=None, stream=False,
+               skill_text: str = "", open_spec=None, worker_mode: str = "chat"):
+    """
+    Parameters
+    ----------
+    worker_mode: str
+        "execute" -> strict JSON tool_call or final response
+        "respond" -> strictly prose final answer
+        "chat"    -> standard fast-path conversational mode
+        "editing" -> returns only code
+    """
+    if worker_mode == "editing":
         system_prompt = """
 You are a senior code editor.
 
@@ -20,86 +29,162 @@ Rules:
         num_predict = 4096
         model = EDITOR_MODEL
 
-    # Chat / Explanation mode
-    elif isinstance(task, dict) and task.get("task_type") in ("chat", "explanation"):
+    elif worker_mode == "chat":
         system_prompt = """
 You are a helpful, conversational AI assistant.
 
 Rules:
 - Respond directly in RAW PLAIN TEXT format.
 - Never output JSON format.
-- Never emit 'tool_call', 'print', 'print_message', or 'print_statement'.
-- Do not attempt to use any tools. Provide your final answer directly to the user.
+- Never emit tools.
+- Provide your final answer directly to the user.
 """
         num_predict = 2048
         model = WORKER_MODEL
 
-    # Normal agent mode
-    else:
+    elif worker_mode == "respond":
+        system_prompt = """
+You are a helpful, conversational AI assistant.
+
+You have just finished using tools to complete a user's request. 
+Produce the user-facing response summarizing what you did.
+
+Rules:
+- Never call tools.
+- Never output JSON.
+- Output plain prose or markdown explaining the resolution.
+"""
+        num_predict = 2048
+        model = WORKER_MODEL
+
+    elif worker_mode == "execute":
         num_predict = 4096
         model = WORKER_MODEL
-        
+
         system_prompt = """
 You are a coding agent operating inside a real, sandboxed project workspace on disk.
 
-FORMAT RULES:
-If you need to use a tool, you MUST output strictly structured JSON. Do NOT wrap in markdown fences.
+You are in EXECUTE mode.
+You may ONLY return one single valid JSON object.
+Legal outputs: 'tool_call' or 'final'.
+Nothing else. No markdown. No explanation. No code fences. No reasoning.
+
+AVAILABLE TOOLS
+
+1. read_file
 {
   "type": "tool_call",
-  "tool": "<tool_name>",
+  "tool": "read_file",
   "args": {
-    "key": "value"
+      "path": "templates/index.html"
   }
 }
 
-If you have the final answer and do NOT need a tool, output RAW PLAIN TEXT. 
-Do NOT output JSON for the final answer. Do NOT use markdown code blocks for the final answer unless sharing code.
+2. write_file
+{
+  "type": "tool_call",
+  "tool": "write_file",
+  "args": {
+      "path": "templates/index.html",
+      "content": "new file content here"
+  }
+}
 
-CODING REASONING PROTOCOL:
+3. replace_chunk
+{
+  "type": "tool_call",
+  "tool": "replace_chunk",
+  "args": {
+      "path": "templates/index.html",
+      "target_code": "old code string",
+      "replacement_code": "new code string"
+  }
+}
 
-Before writing or modifying code, internally perform these checks:
+4. list_files
+{
+  "type": "tool_call",
+  "tool": "list_files",
+  "args": {}
+}
 
-1. STATE MODEL
-Identify mutable state variables and valid transitions.
+5. run_command
+{
+  "type": "tool_call",
+  "tool": "run_command",
+  "args": {
+      "command": "python script.py"
+  }
+}
 
-2. INVARIANTS
-List rules that must always remain true.
+If you need to use a tool, return its JSON schema exactly.
+If you have completed the edits/task and need no further tools, return:
+{
+  "type": "final"
+}
 
-Examples:
-- snake cannot reverse into itself
-- queue size cannot become negative
-- authenticated user cannot be None during protected actions
-
-3. EDGE CASES
-Check boundary conditions and invalid inputs.
-
-4. FAILURE CHECK
-Ask:
-"What code would compile but still behave incorrectly?"
-
-Then proceed with tool calls or final answer.
-
-- Once the tool result for the user's requested action comes back successful, your NEXT output must be the final plain-text answer. Do not chain additional verification tool calls the user did not ask for.
-
-Rules:
-- Answer using project context if available.
-- Do not hallucinate missing code.
-- Cite file names and symbols.
-- Avoid words: likely, may, often, typically, probably.
+IMPORTANT EXECUTION RULES:
+- If your last ToolResult for run_command was success=True, determine if the user's request is already satisfied. If yes, output {"type": "final"}.
+- Do NOT repeat the exact same run_command consecutively unless the user explicitly requested retries.
 """
+        
+        task_type = task.get("task_type", "coding")
+        if task_type == "execute":
+            # Derive real Python file list from workspace so worker never invents filenames
+            try:
+                from core.execution_state import ExecutionState as _ES
+                from core.session import ProjectSession as _PS
+                _py_files = _ES(task_type="execute").workspace_python_files(
+                    cwd=session.root if hasattr(session, "root") else "."
+                )
+                if _py_files:
+                    _file_list_str = "\n".join(f"  - {f}" for f in _py_files)
+                    system_prompt += (
+                        f"\nTASK TYPE: EXECUTE\n"
+                        f"Preferred tool: run_command\n"
+                        f"Do NOT edit files unless explicitly requested.\n\n"
+                        f"WORKSPACE PYTHON FILES (use one of these - do NOT invent filenames):\n"
+                        f"{_file_list_str}\n\n"
+                        f"If asked to run/start/launch a backend or server, pick the most likely entry point "
+                        f"from the list above. If uncertain, call list_files first.\n"
+                    )
+                else:
+                    system_prompt += (
+                        "\nTASK TYPE: EXECUTE\nPreferred tool: run_command\n"
+                        "Do NOT edit files unless explicitly requested.\n"
+                        "Call list_files first to discover the entry point before running python.\n"
+                    )
+            except Exception:
+                system_prompt += "\nTASK TYPE: EXECUTE\nPreferred tool: run_command\nDo NOT edit files unless explicitly requested.\n"
+
+        elif task_type == "coding":
+            system_prompt += "\nTASK TYPE: CODING\nUse editing tools (write_file, replace_chunk) to fulfill the requirements.\n"
+        elif task_type == "file_analysis":
+            system_prompt += "\nTASK TYPE: FILE ANALYSIS\nPreferred tools: read_file, list_files. Do not edit files.\n"
+
+
+
 
         from systems.memory import get_memory
         import json
         memory = get_memory(session)
         if memory:
-            # T3 fix: compact serialisation (no indent) + cap to 20 most-recent
-            # entries. indent=2 adds ~30% whitespace tokens for zero benefit to
-            # the model. 50-entry dumps were costing ~220 tokens every LLM call.
             _mem_entries = dict(list(memory.items())[-20:])
             system_prompt += f"\nPROJECT MEMORY:\n{json.dumps(_mem_entries)}\n"
 
         if context:
             system_prompt += f"\nRETRIEVED PROJECT CONTEXT:\n\n{context}\n\nThe retrieved context is trusted project evidence.\nPrefer it over guessing.\n"
+
+        if open_spec is not None:
+            system_prompt += f"\n\n{open_spec.render()}\n"
+
+        if skill_text:
+            system_prompt += (
+                f"\n\nRELEVANT SKILLS:\n"
+                f"The following are reference guidelines and best practices. "
+                f"They are NOT executable tools. Do NOT emit tool calls for these skills.\n\n"
+                f"{skill_text}\n"
+            )
 
     worker_messages = [
         {
@@ -120,4 +205,4 @@ Rules:
         stream=stream,
         num_predict=num_predict
     )
-    return response
+    return response

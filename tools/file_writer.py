@@ -1,14 +1,15 @@
 import os
 import ast
 import shutil
+from core.tool_result import ToolResult
 from core.sandbox import sandbox
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
-def write_file(path, content):
+def write_file(path, content) -> ToolResult:
     if not content.strip():
-        return "Error: Refusing to write empty content."
+        return ToolResult(success=False, stdout="", stderr="Error: Refusing to write empty content.")
             
     try:
         safe_path = sandbox.get_safe_path(path)
@@ -34,7 +35,7 @@ def write_file(path, content):
                     shutil.move(backup_path, safe_path)
                 else:
                     os.remove(safe_path)
-                return f"Error: Write aborted due to SyntaxError: {e}. Backup restored."
+                return ToolResult(success=False, stdout="", stderr=f"Error: Write aborted due to SyntaxError: {e}. Backup restored.")
                         
         if os.path.exists(backup_path):
             os.remove(backup_path)
@@ -43,8 +44,8 @@ def write_file(path, content):
         # to the session object that update_file_index requires. write_file()
         # itself has no session, so it cannot safely call update_file_index.
                 
-        return "File updated successfully."
+        return ToolResult(success=True, stdout="File updated successfully.", summary=f"Wrote to {path}.")
     except Exception as e:
         print("WRITE_FILE ERROR:", repr(e))
         logger.error(f"Failed to write file {path}: {e}")
-        return f"Error: {e}"
+        return ToolResult(success=False, stdout="", stderr=f"Error: {e}")

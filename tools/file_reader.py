@@ -1,10 +1,11 @@
 import os
 import sys
+from core.tool_result import ToolResult
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
-def read_file(path):
+def read_file(path) -> ToolResult:
     """
     Reads a file directly from the file system using sandbox safe path.
     Returns RAW file content only — no markdown fences, no header/footer
@@ -24,23 +25,27 @@ def read_file(path):
         safe_path = sandbox.get_safe_path(path)
 
         if not os.path.exists(safe_path):
-            return f"Error: File '{path}' does not exist on disk."
+            return ToolResult(success=False, stdout="", stderr=f"Error: File '{path}' does not exist on disk.")
 
         if os.path.isdir(safe_path):
-            return f"Error: '{path}' is a directory, not a file."
+            return ToolResult(success=False, stdout="", stderr=f"Error: '{path}' is a directory, not a file.")
 
         # Prevent massive memory consumption/OOM on huge files (limit: 2MB)
         try:
             if os.path.getsize(safe_path) > 2 * 1024 * 1024:
-                return f"Error: File '{path}' exceeds the 2MB read limit. Cannot load into agent memory."
+                return ToolResult(success=False, stdout="", stderr=f"Error: File '{path}' exceeds the 2MB read limit.")
         except OSError as e:
-            return f"Error: Cannot access file '{path}': {e}"
+            return ToolResult(success=False, stdout="", stderr=f"Error: Cannot access file '{path}': {e}")
 
         with open(safe_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        return content
+        return ToolResult(
+            success=True,
+            stdout=content,
+            summary=f"Read {len(content)} bytes from {path}."
+        )
 
     except Exception as e:
         logger.exception("Failed to read file")
-        return f"Error reading file: {str(e)}"
+        return ToolResult(success=False, stdout="", stderr=f"Error reading file: {str(e)}")

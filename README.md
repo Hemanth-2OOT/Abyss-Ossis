@@ -1,4 +1,4 @@
-# ABYSS OSSIS — Complete Guide
+# ABYSS OSSIS — Complete Guide (v1.0)
 
 > A local-first, zero-cost AI coding agent powered by Qwen 2.5 Coder 7B.
 > Works like Claude Code / Cursor — but runs entirely on your machine.
@@ -12,18 +12,14 @@
 1. [What is Abyss Ossis?](#what-is-abyss-ossis)
 2. [Installation](#installation)
 3. [Quick Start](#quick-start)
-4. [How It Works](#how-it-works)
+4. [How It Works (Execution Architecture)](#how-it-works-execution-architecture)
 5. [All Commands](#all-commands)
-6. [Agent Mode (Natural Language)](#agent-mode)
-7. [Autonomous Tool Calls](#autonomous-tool-calls)
-8. [File Editing](#file-editing)
-9. [Project Memory](#project-memory)
-10. [Project Isolation](#project-isolation)
-11. [Storage & Limits](#storage--limits)
-12. [Architecture](#architecture)
-13. [Configuration](#configuration)
-14. [Troubleshooting](#troubleshooting)
-15. [Tips for Best Results](#tips-for-best-results)
+6. [Autonomous Tool Calls](#autonomous-tool-calls)
+7. [File Editing & Security](#file-editing--security)
+8. [Project Memory](#project-memory)
+9. [Project Isolation](#project-isolation)
+10. [Codebase Structure](#codebase-structure)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -44,485 +40,203 @@ Abyss Ossis (LocalAgent) is a **project-attached coding runtime** — an AI agen
 
 - **Understand your codebase** — AST-indexed + FAISS semantic search
 - **Answer questions** — grounded in actual project files, not hallucinations
-- **Edit files safely** — patch-based targeted edits, not full file rewrites
-- **Run commands** — with explicit user approval (y/n)
+- **Edit files safely** — targeted replacement (`replace_chunk`), not full file rewrites
+- **Run commands** — executes tests, scripts, and backgrounds long-running servers securely
 - **Remember facts** — persistent per-project memory across sessions
-- **Stream responses** — real-time token output like Claude Code
-- **Self-correct** — built-in critic loop that validates responses
+- **Self-correct** — built-in retry exhaustion guard and JSON format recovery
 
 ---
 
 ## Installation
 
 ### Step 1: Install Ollama
-
 Download from [https://ollama.com](https://ollama.com) and install it.
 
 ### Step 2: Pull the model
-
 ```bash
 ollama pull qwen2.5-coder:7b
 ```
 
-### Step 3: Clone / locate the agent
-
-```
-C:\Users\HEMANTH\Desktop\local_agent\
-```
-
-### Step 4: Install Python dependencies
-
+### Step 3: Install Python dependencies
 ```bash
-cd C:\Users\HEMANTH\Desktop\local_agent
+cd local_agent
 pip install -r requirements.txt
 ```
 
-The dependencies are minimal:
-```
-requests    — HTTP client for Ollama API
-numpy       — numerical operations for FAISS
-rich        — terminal formatting and colors
-faiss-cpu   — semantic vector search
-```
-
-### Step 5: Start Ollama
-
-Open a separate terminal and run:
-```bash
-ollama serve
-```
-
-Leave this running in the background.
+### Step 4: Start Ollama
+Open a separate terminal and run `ollama serve`. Leave this running in the background.
 
 ---
 
 ## Quick Start
 
 ### Launch the agent on any project:
-
 ```bash
 python cli.py run C:\path\to\your\project
-```
-
-### Example:
-
-```bash
-python cli.py run C:\projects\my-flask-app
-```
-
-### What you will see:
-
-```
-    ╔══════════════════════════════════════════════════════════════════╗
-    ║     █████╗ ██████╗ ██╗   ██╗███████╗███████╗                   ║
-    ║    ██╔══██╗██╔══██╗╚██╗ ██╔╝██╔════╝██╔════╝                   ║
-    ║    ███████║██████╔╝ ╚████╔╝ ███████╗███████╗                   ║
-    ║    ██╔══██║██╔══██╗  ╚██╔╝  ╚════██║╚════██║                   ║
-    ║    ██║  ██║██████╔╝   ██║   ███████║███████║                   ║
-    ║    ╚═╝  ╚═╝╚═════╝    ╚═╝   ╚══════╝╚══════╝                   ║
-    ║      ██████╗ ███████╗███████╗██╗███████╗                       ║
-    ║     ██╔═══██╗██╔════╝██╔════╝██║██╔════╝                       ║
-    ║     ██║   ██║███████╗███████╗██║███████╗                       ║
-    ║     ██║   ██║╚════██║╚════██║██║╚════██║                       ║
-    ║     ╚██████╔╝███████║███████║██║███████║                       ║
-    ║      ╚═════╝ ╚══════╝╚══════╝╚═╝╚══════╝                       ║
-    ╚══════════════════════════════════════════════════════════════════╝
-
-  Local AI Coding Agent · Qwen 2.5 Coder 7B · Ollama
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Workspace:  C:\projects\my-flask-app
-  Memory:     C:\projects\my-flask-app\.localagent.memory.json
-  Index:      C:\projects\my-flask-app\.localagent.index.json
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Type a question, a /command, or /exit to quit.
-
->
 ```
 
 On **first launch**, the agent automatically:
 1. Scans all project files
 2. Builds an AST index (functions, classes, imports)
 3. Creates `.localagent.index.json`, `.localagent.memory.json`, `.localagent.logs.txt`
-4. Logs `"Project initialized"`
 
-You are now ready to work.
+You can immediately start typing natural language requests.
 
 ---
 
-## How It Works
+## How It Works (Execution Architecture)
+
+Abyss Ossis uses a highly deterministic, multi-phase execution loop designed to extract reliable tool usage from small (7B) local models.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        YOU TYPE                             │
-│                    "explain auth.py"                        │
+│               "run the backend and fix the UI"              │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            ▼
               ┌────────────────────────┐
-              │     ORCHESTRATOR       │  Classifies your task
-              │  (needs retrieval?     │  (question / edit / plan)
-              │   needs planner?)      │
+              │     ORCHESTRATOR       │  Heuristic Task Classifier
+              │  (task_type: execute)  │  Assigns capability profile
               └───────────┬────────────┘
                           │
                           ▼
               ┌────────────────────────┐
-              │   RETRIEVAL ENGINE     │  AST index + FAISS search
-              │  (finds relevant code) │  Budget: 2500 chars max
+              │   WORKER (EXECUTE)     │  Generates strictly JSON tools.
+              │  (streams <think>      │  Injects real workspace context
+              │   blocks securely)     │  so it doesn't hallucinate paths.
               └───────────┬────────────┘
                           │
                           ▼
               ┌────────────────────────┐
-              │     WORKER LLM         │  Qwen 2.5 Coder 7B
-              │  (generates answer     │  Streaming output
-              │   or tool call)        │
-              └───────────┬────────────┘
-                          │
-                    ┌─────┴──────┐
-                    │            │
-                    ▼            ▼
-            ┌──────────┐  ┌───────────┐
-            │ TOOL CALL │  │  RESPONSE │
-            │ (execute  │  │  (stream  │
-            │  & retry) │  │  to you)  │
-            └─────┬─────┘  └─────┬─────┘
-                  │              │
-                  ▼              ▼
-              ┌────────────────────────┐
-              │       CRITIC LLM       │  Validates response
-              │   (max 2 passes)       │  Checks for hallucination
+              │    TOOL DISPATCHER     │  Executes tool logic securely.
+              │  Records ToolEvents    │  Hard-aborts batch on unknown/
+              │  to ExecutionState     │  illegal tools.
               └───────────┬────────────┘
                           │
                           ▼
               ┌────────────────────────┐
-              │    FINAL OUTPUT        │  Streamed to your terminal
-              │   + saved to logs      │
+              │ POST-TOOL VALIDATOR    │  Checks ExecutionState against
+              │  (Did the task meet    │  declarative Task Contracts.
+              │   its requirements?)   │  If not, auto-retries worker.
+              └───────────┬────────────┘
+                          │
+                          ▼
+              ┌────────────────────────┐
+              │   WORKER (RESPOND)     │  Fed purely the factual transcript
+              │  Generates final prose │  (files read, edited, commands).
+              │  summary for the user. │  Zero hallucination.
               └────────────────────────┘
 ```
+
+**Key Innovations:**
+- **`ExecutionState`**: The single source of truth. Every executed tool records a `ToolEvent` (args, success status, output).
+- **The 3-Layer Truth Model**: Execution cleanly separates OS truth (`returncode`), semantic completeness (`success = returncode == 0`), and runtime state (`status = "completed" | "running" | "failed"`). A server can be "running" but not semantically "completed" until explicitly verified.
+- **`TaskContracts`**: A coding task isn't "complete" just because the LLM says `"type": "final"`. The validator checks `ExecutionState` to prove that a file was *actually* edited or a command explicitly returned code 0 before accepting completion.
+- **`RESPOND` phase**: The final answer is generated completely isolated from the execution scratchpad, fed only factual, proven events.
 
 ---
 
 ## All Commands
 
 ### File Operations
-
 | Command | What it does | Example |
 |---|---|---|
-| `/read <file>` | Display file contents | `/read src/app.py` |
-| `/write <file> <content>` | Create/overwrite a file | `/write test.txt hello world` |
-| `/ls` | List all files in workspace | `/ls` |
-| `/edit <file> <instruction>` | AI-powered edit with diff preview | `/edit utils.py add error handling` |
+| `/read <file>` | Read file contents (extracts ToolResult) | `/read src/app.py` |
+| `/write <file> <text>` | Overwrite a file | `/write test.txt hello` |
+| `/ls` | List all workspace files | `/ls` |
+| `/edit <file> <inst>` | AI-powered edit with diff preview | `/edit utils.py add logging` |
 
 ### Index & Search
-
-| Command | What it does | Example |
-|---|---|---|
-| `/index` | Rebuild project index from scratch | `/index` |
-| `/showindex` | Display raw index data | `/showindex` |
-| `/find <keyword>` | Search for a symbol, file, or function | `/find authenticate` |
-
-### Memory
-
-| Command | What it does | Example |
-|---|---|---|
-| `/remember <key> <value>` | Store a fact about this project | `/remember db postgres` |
-| `/forget <key>` | Delete a stored fact | `/forget db` |
-| `/memory` | Show all stored facts | `/memory` |
-
-### System
-
 | Command | What it does |
 |---|---|
-| `/exit` | Quit the agent |
+| `/index` | Rebuild AST + FAISS index from scratch |
+| `/showindex` | Display raw semantic index data |
+| `/find <keyword>`| Search codebase for a symbol |
 
----
-
-## Agent Mode
-
-Type any natural language without a `/` prefix — the agent enters **autonomous mode**:
-
-```
-> what does run_worker do?
-
-> explain the authentication flow in this project
-
-> find all files that use the database connection
-
-> why is this test failing?
-
-> refactor the error handling in cli.py
-```
-
-### Streaming
-
-Responses stream token-by-token in real-time. You see the answer building character by character — just like Claude Code. If the agent is making a tool call (JSON), it buffers silently until done, then executes.
-
-### Clarification Mode
-
-If the agent is uncertain, it **stops and asks you** instead of guessing:
-
-```
-I need clarification before continuing.
-Reply with option or full path (or 'n' to stop):
-```
-
-Or after the Critic flags uncertainty:
-
-```
-Critic flagged response. I am not fully sure.
-Proceed anyway? (y/n or clarification):
-```
-
-- `y` → accept the response
-- `n` → abort
-- Anything else → your text is injected as additional context and the agent retries
+### Memory
+| Command | What it does |
+|---|---|
+| `/remember <k> <v>`| Store a permanent fact (e.g. `/remember framework flask`) |
+| `/forget <k>` | Delete a fact |
+| `/memory` | Show all stored facts |
 
 ---
 
 ## Autonomous Tool Calls
 
-The LLM can decide to use tools on its own. These are the available tools:
+When you use natural language, the agent routes to EXECUTE mode and may emit tools.
 
-| Tool | What it does | Requires approval? |
-|---|---|---|
-| `read_file` | Read a file for context | No (safe) |
-| `list_files` | List directory | No (safe) |
-| `search_index` | Search code index | No (safe) |
-| `replace_chunk` | Targeted find-and-replace edit | No (safe, precise) |
-| `run_command` | Execute a shell command | **YES — asks y/n** |
+| Tool | Capability |
+|---|---|
+| `read_file` | Read files (cached to prevent duplicate reads) |
+| `list_files` | Directory listing |
+| `replace_chunk`| Targeted find-and-replace (line-exact replacement) |
+| `run_command` | Execute tests or launch long-running servers securely |
 
-### How `run_command` works:
-
-```
-> run the tests
-
-Tool Call: run_command({'command': 'pytest tests/'})
-Execute 'pytest tests/'? (y/n): y
-
-Exit code 0
-STDOUT:
-4 passed in 1.2s
-```
-
-**Nothing executes until you type `y`.** Output is truncated to the last 1000 characters to protect the model's context window.
-
-### Tool loop limits:
-
-- Maximum **2 tool calls** per question
-- Maximum **2 critic retry passes**
-- If parsing fails, the raw text is shown as-is (never crashes)
+### Hardened Tool Dispatcher:
+- **Duplicate loop prevention**: If a model gets stuck calling the same tool with the exact same args 3 times, the system flags an infinite loop and forcibly halts.
+- **Parse exhaustion**: If the LLM generates invalid JSON 3 times in a row, the pipeline cleanly aborts.
+- **Batch invalidation**: If a model generates multiple tools in one turn, but includes an unknown or forbidden tool, execution of the entire batch stops immediately to prevent corrupted state.
 
 ---
 
-## File Editing
+## File Editing & Security
 
-### `/edit` Command (Interactive, with diff preview)
+### `replace_chunk`
+We never ask 7B models to rewrite 500-line files. `replace_chunk` uses exact string targeting to drop-in replacements seamlessly.
 
-```
-> /edit src/auth.py add input validation to the login function
-```
-
-What happens:
-1. The agent reads the current file
-2. The LLM generates the edited version
-3. You see a **color-coded diff**:
-   ```
-   - old_line
-   + new_line
-   ```
-4. You confirm: `Apply changes? (y/n)`
-5. Only applied if you say `y`
-
-### `replace_chunk` Tool (Autonomous, targeted)
-
-When you ask the agent to fix something conversationally, it uses `replace_chunk` — a targeted string replacement. It only changes the exact lines that need changing, not the full file. This is critical for a 7B model that can't reliably regenerate 500-line files.
+### `run_command`
+A strict runtime policy handles bash execution:
+1. `python <file>` is **only** permitted if `os.path.isfile(file)` returns true. The agent cannot hallucinate non-existent entry points.
+2. Long-running frameworks (`flask`, `fastapi`, `uvicorn`, `npm start`) trigger a **6-second observation window**. The process is allowed to boot and stabilize. 
+3. **Execution Semantics**: The system forces strict OS-level exit code validation. A process is only marked semantically `success=True` if it exits with `returncode == 0` or completes a successful long-running server boot. Semantic correctness is strictly decoupled from process liveness to prevent phantom execution loops.
 
 ---
 
-## Project Memory
+## Project Memory & Isolation
 
-Memory lets you teach the agent permanent facts about your project.
+### Memory Injection
+Facts stored via `/remember` are dynamically injected into the system prompt at runtime. The LLM sees them on every pass. (Capped at 50 entries to prevent prompt bloat).
 
-### Store facts:
-
+### Workspace Sandboxing
+Each project directory has an isolated state:
 ```
-> /remember framework flask
-> /remember database postgresql
-> /remember convention use-type-hints-always
-> /remember deploy heroku
-> /remember style black-formatter
+my-project/
+├── .localagent.index.json      ← AST / Semantic index
+├── .localagent.memory.json     ← Memory facts
+├── .localagent.logs.txt        ← Rolling log buffer
 ```
-
-### How memory works:
-
-Every time the agent runs, **all memory entries are injected** into the LLM's system prompt:
-
-```
-PROJECT MEMORY:
-{
-  "framework": "flask",
-  "database": "postgresql",
-  "convention": "use-type-hints-always"
-}
-```
-
-The model sees this on every single response. It never forgets.
-
-### Limits:
-
-- Maximum **50 entries** (oldest are auto-dropped)
-- Memory is project-scoped (each project has its own)
-- Memory persists across sessions
+File resolution is strongly sandboxed to the project root. Path traversal (`../`) is intercepted and rejected by `core.sandbox`.
 
 ---
 
-## Project Isolation
-
-Each project directory is a **completely isolated workspace**:
-
-```
-C:\projects\flask-app\
-├── .localagent.index.json      ← this project's code index
-├── .localagent.memory.json     ← this project's memory
-├── .localagent.logs.txt        ← this project's execution history
-├── app.py
-└── ...
-
-C:\projects\react-app\
-├── .localagent.index.json      ← completely separate
-├── .localagent.memory.json     ← completely separate
-├── .localagent.logs.txt        ← completely separate
-├── src/
-└── ...
-```
-
-- You can run **multiple agents simultaneously** on different projects
-- Memory, index, and logs **never interfere** across projects
-- The sandbox is **locked** to the project root — the agent cannot access files outside it
-
----
-
-## Storage & Limits
-
-Abyss Ossis is **garbage-proof by design**:
-
-| Artifact | Strategy | Max Size |
-|---|---|---|
-| **Memory** | Capped at 50 entries, oldest auto-dropped | ~5 KB |
-| **Index** | Always rebuilt from scratch via `/index`, never appended | Proportional to project |
-| **Logs** | Rolling window — keeps last 500 lines only | ~50 KB |
-
-Nothing grows unbounded. Nothing accumulates garbage.
-
----
-
-## Architecture
+## Codebase Structure
 
 ```
 local_agent/
-├── cli.py                    # Main interactive loop, tool routing, streaming
-├── config.py                 # Model name, temperature, context limits
-├── requirements.txt          # Python dependencies
+├── cli.py                    # Multi-turn execution orchestrator
+├── config.py                 # Hyperparameters (models, temp, budget)
 │
 ├── core/
-│   ├── session.py            # ProjectSession — per-project isolation
-│   ├── orchestrator.py       # Task classification (question/edit/plan)
-│   ├── worker.py             # LLM prompt builder + Ollama execution
-│   ├── critic.py             # Response validation (max 2 passes)
-│   ├── planner.py            # Step-by-step plan generation
-│   ├── sandbox.py            # Path security — locks to project root
-│   ├── guards.py             # requires_more_info() checks
-│   ├── tool_router.py        # Auto-detect /ls, /read from plain text
-│   ├── tool_schema.py        # Tool registry (read_file, replace_chunk, etc.)
-│   ├── logger.py             # Logging setup
-│   └── editor.py             # Editor utilities
+│   ├── orchestrator.py       # Adaptive routing & complexity scoring
+│   ├── worker.py             # Context injection & Ollama execution
+│   ├── execution_state.py    # Transactional state store (ToolEvents)
+│   ├── post_tool_validator.py# Task Contract verification rules
+│   ├── tool_result.py        # Abstract Tool Output standard
+│   └── sandbox.py            # Path resolution & security locks
 │
 ├── systems/
-│   ├── ollama_client.py      # Ollama API wrapper + streaming
-│   ├── memory.py             # Per-project JSON memory (load/save/remember/forget)
-│   ├── state.py              # Conversation state (message history)
-│   ├── semantic_index.py     # FAISS vector index for semantic search
-│   └── rag.py                # RAG retrieval utilities
+│   ├── ollama_client.py      # LLM stream parsing & connection
+│   ├── memory.py             # Cross-session persistence
+│   └── semantic_index.py     # Codebase FAISS querying
 │
 ├── tools/
-│   ├── code_indexer.py       # AST parser — extracts functions, classes, imports
-│   ├── index_storage.py      # Index save/load/search (per-session)
-│   ├── context_builder.py    # Builds context string from search results
-│   ├── file_reader.py        # Safe file reading
-│   ├── file_writer.py        # Safe file writing
-│   ├── directory_reader.py   # List files in workspace
-│   ├── diff_viewer.py        # Color-coded diff display
-│   ├── edit_utils.py         # Edit prompt builder
-│   ├── chunker.py            # Text chunking utilities
-│   ├── embedder.py           # Text embedding for FAISS
-│   ├── search_code.py        # Code search utilities
-│   └── run_tests.py          # Test runner
-│
-├── data/                     # Legacy data directory
-└── prompts/                  # Prompt templates
+│   ├── replace_chunk.py      # Micro-editing engine
+│   ├── run_command.py        # Safe runtime & observation bounds
+│   └── code_indexer.py       # AST structure parsing
 ```
 
 ---
 
-## Configuration
-
-Edit `config.py` to customize:
-
-```python
-MODEL = "qwen2.5-coder:7b"   # Change model (e.g., "codellama:13b")
-TEMPERATURE = 0.2             # Lower = more deterministic
-MAX_CONTEXT = 4096            # Context window budget
-WHITELIST_DIRS = []            # Allow access outside workspace
-```
-
----
-
-## Troubleshooting
-
-| Problem | Cause | Solution |
-|---|---|---|
-| `Cannot connect to Ollama` | Ollama not running | Run `ollama serve` in a separate terminal |
-| `Usage: python cli.py run <project_path>` | Missing arguments | Use `python cli.py run C:\path\to\project` |
-| Agent gives generic/wrong answers | Index is outdated | Run `/index` to rebuild |
-| Agent hallucinates code | No context found | Use `/find` to check what's indexed, then `/index` |
-| Agent is slow | CPU inference | Normal for 7B on CPU. GPU accelerates 5-10x |
-| `Access denied: Path outside workspace` | Sandbox blocked it | The file is outside your project root |
-| Tool call fails to parse | Model output bad JSON | Agent auto-falls back to plain text. Retry. |
-| Memory full | 50+ entries | Oldest are auto-dropped. Use `/forget` to clean up. |
-
----
-
-## Tips for Best Results
-
-1. **Always `/index` after major file changes** — the agent relies on the index to find relevant code
-2. **Use `/remember` for architecture decisions** — the model reads these on every response
-3. **Be specific** — `"explain the login function in auth.py"` works far better than `"how does this work"`
-4. **Use `/find` before asking** — check what the index knows, so you can ask targeted questions
-5. **Don't paste huge code blocks** — let the retrieval system find code for you
-6. **Re-index when switching branches** — `/index` rebuilds from scratch
-7. **Use `/edit` for small changes** — the diff preview lets you verify before applying
-8. **Trust the clarification prompts** — if the agent pauses to ask, give it specific info
-
----
-
-## Comparison with Claude Code
-
-| Feature | Claude Code | Abyss Ossis |
-|---|---|---|
-| Model | Claude 3.5 Sonnet (200B+) | Qwen 2.5 Coder 7B |
-| Cost | $20/month | **Free** |
-| Privacy | Cloud | **100% Local** |
-| Internet required | Yes | **No** |
-| Context window | 200K tokens | ~8K tokens (managed by budget) |
-| File editing | Full rewrite | **Targeted patch edits** |
-| Tool execution | Auto | **User-approved (y/n)** |
-| Project memory | Implicit | **Explicit `/remember` system** |
-| Streaming | Yes | **Yes** |
-| Multi-project | Yes | **Yes (isolated sessions)** |
-| Code indexing | Built-in | **AST + FAISS semantic** |
-
----
-
-*Built with ❤️ for developers who want AI coding without the cloud.*
-## Star History
-
-If this project helps you, consider starring it ⭐
+*Built with ❤️ for developers who want agentic AI without the cloud.*

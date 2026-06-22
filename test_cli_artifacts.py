@@ -25,7 +25,7 @@ class TestInferExpectedArtifacts(unittest.TestCase):
         user_input = "Fix the game logic."
         plan_steps = ["1. Read gameloop.py", "2. Edit main.py"]
         
-        artifacts = _infer_expected_artifacts(user_input, plan_steps, self.session)
+        artifacts = _infer_expected_artifacts(user_input, plan_steps)
         
         # gameloop.py should be ignored because it doesn't exist and wasn't requested.
         self.assertNotIn("gameloop.py", artifacts)
@@ -37,7 +37,7 @@ class TestInferExpectedArtifacts(unittest.TestCase):
         user_input = "Create test_utils.py"
         plan_steps = ["1. Write test_utils.py"]
         
-        artifacts = _infer_expected_artifacts(user_input, plan_steps, self.session)
+        artifacts = _infer_expected_artifacts(user_input, plan_steps)
         
         # test_utils.py MUST be included because the user explicitly asked for it.
         self.assertIn("test_utils.py", artifacts)
