@@ -19,14 +19,49 @@ def replace_chunk(path: str, target_code: str, replacement_code: str, content_si
         return read_res
         
     content = read_res.stdout
-    if target_code not in content:
+    
+    occurrences = content.count(target_code)
+    
+    if occurrences == 1:
+        updated_content = content.replace(target_code, replacement_code)
+    elif occurrences > 1:
         return ToolResult(
             success=False, 
             stdout="", 
-            stderr="Error: target_code not found in file."
+            stderr="Error: Target code matches multiple locations. Provide more surrounding context lines to make it unique."
         )
+    else:
+        # Fallback: Normalize line endings and trailing whitespace
+        import re
+        lines = target_code.replace('\r', '').split('\n')
+        pattern_parts = []
+        for i, line in enumerate(lines):
+            escaped_line = re.escape(line.rstrip(" \t"))
+            if i < len(lines) - 1:
+                pattern_parts.append(escaped_line + r"[ \t]*\r?\n")
+            else:
+                pattern_parts.append(escaped_line + r"[ \t]*")
+                
+        pattern_str = "".join(pattern_parts)
+        pattern = re.compile(pattern_str)
         
-    updated_content = content.replace(target_code, replacement_code)
+        matches = list(pattern.finditer(content))
+        
+        if len(matches) == 0:
+            return ToolResult(
+                success=False, 
+                stdout="", 
+                stderr="Error: target_code not found in file. Ensure you are providing exact lines, including leading indentation."
+            )
+        elif len(matches) > 1:
+            return ToolResult(
+                success=False, 
+                stdout="", 
+                stderr="Error: Target code matches multiple locations (after relaxing whitespace). Provide more surrounding context lines to make it unique."
+            )
+        else:
+            match = matches[0]
+            updated_content = content[:match.start()] + replacement_code + content[match.end():]
     content_hash = hashlib.sha256(updated_content.encode("utf-8")).hexdigest()
     file_content_sig = (path.lower(), content_hash)
     

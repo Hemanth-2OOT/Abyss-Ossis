@@ -23,7 +23,7 @@ from core.critic import critique_response
 from core.guards import requires_more_info
 from core.skill_selector import select_skills
 from core.open_spec import build_open_spec
-from core.post_tool_validator import validate_post_tool
+from core.post_tool_validator import update_scheduler_state, RequirementStatus
 from core.execution_state import ExecutionState, ToolEvent
 from core.tool_result import ToolResult
 
@@ -204,25 +204,6 @@ def _extract_embedded_tool_call(text):
         search_from = start + 1
 
 
-def _infer_expected_artifacts(user_input, plan_steps):
-    """Combines explicit extraction, plan blueprinting, and structural heuristics."""
-    artifacts = set()
-    # Explicitly filter by standard extensions to avoid matching programmatic properties or dot methods
-    file_pattern = re.compile(r"([a-zA-Z0-9_\-\.\/]+\.(?:py|html|css|json|md|txt|sh|js))")
-
-    for step in plan_steps:
-        matches = file_pattern.findall(str(step))
-        for m in matches:
-            if not m.startswith(("http", "pip", "python")):
-                artifacts.add(normalize_path(m))
-
-    matches = file_pattern.findall(user_input)
-    for m in matches:
-        if not m.startswith(("http", "pip", "python")):
-            artifacts.add(normalize_path(m))
-
-    return artifacts
-
 
 def main(session):
     watchdog.start()
@@ -257,6 +238,9 @@ def main(session):
     while True:
         global metrics
         metrics = MetricsTracker()
+        exec_state = None
+        task_start_time = None
+        termination_reason = "NORMAL"
         
         try:
             user_input = input("\n> ").strip()
@@ -452,7 +436,13 @@ def main(session):
                 from core.planner import generate_plan
                 console.print("[yellow]Generating execution plan...[/yellow]")
                 metrics.record_llm_call()
-                plan_steps = generate_plan(user_input, full_context)
+                import time
+                _p_start = time.time()
+                plan_payload = generate_plan(user_input, full_context)
+                metrics.planner_time += (time.time() - _p_start)
+                plan_steps = plan_payload.get("steps", [])
+                plan_reqs = plan_payload.get("requirements", [])
+                
                 console.print("\n[bold cyan]Execution Plan:[/bold cyan]")
                 for i, step in enumerate(plan_steps, 1):
                     console.print(f"  {i}. ", style="cyan", end="")
@@ -460,40 +450,43 @@ def main(session):
                 plan_str = "Execution Plan:\n" + "\n".join(
                     f"{i}. {s}" for i, s in enumerate(plan_steps, 1)
                 )
+                if plan_reqs:
+                    plan_str += "\n\nTask Requirements:\n" + "\n".join(f"- [{r.get('id')}] {r.get('type')}: {r.get('args', {})}" for r in plan_reqs)
                 full_context = (full_context + "\n\n" + plan_str) if full_context else plan_str
             else:
                 plan_steps = []
-
-            # Extract expected blueprints uniformly using the master normalization engine
-            expected_files = {normalize_path(p) for p in _infer_expected_artifacts(user_input, plan_steps)}
-
-            # State Machine: Check if the plan specifically mandates validation or testing verification commands
-            has_validation_commands = any(
-                any(keyword in str(step).lower() for keyword in ["run", "python", "pytest", "test", "execute"])
-                for step in plan_steps
-            )
-            if has_validation_commands:
-                console.print("[dim]Runtime State Machine initialized: Awaiting verification phase execution.[/dim]")
+                plan_reqs = []
 
             state.add_message("user", user_input)
 
-            max_passes     = 3 if task.get("task_type") == "coding" else 2
-            passes         = 0
+            import time
+            task_start_time = time.time()
+            validation_success = False
+
             worker_history = list(state.messages)
             if task.get("task_type") in ("chat", "explanation"):
                 worker_history = worker_history[-6:]
-            max_tool_loops = 8 if task.get("task_type") == "coding" else 3
-            tool_loops     = 0
-            parse_fail_count = 0
             response_content = ""
 
             # Unified Tracking Databases
-            exec_state = ExecutionState(task_type=task.get("task_type", "chat"))
+            exec_state = ExecutionState(task_type=task.get("task_type", "chat"), user_prompt=user_input)
+            
+            from core.execution_state import Requirement
+            import re
+            for r in plan_reqs:
+                args = r.get("args", {})
+                if "path" in args and isinstance(args["path"], str):
+                    args["path"] = re.sub(r'(\.(?:py|js|ts|html|css|json|yaml|yml|md|txt|toml|cfg|ini|sh))\.(\d+)$', r'\1', args["path"].strip())
+                exec_state.requirements.append(Requirement(
+                    id=r.get("id", ""),
+                    type=r.get("type", ""),
+                    args=args,
+                    metadata={"purpose": r.get("metadata", {}).get("purpose")},
+                    depends_on=r.get("depends_on", [])
+                ))
             content_signatures = set()
             tool_signatures_counter = defaultdict(int)
             
-            # Stateful Verification Tracking Switches
-            last_tool_metadata = None
             last_successful_tool_sig = None
             last_successful_tool_result_str = ""
             task_completed = False
@@ -508,7 +501,16 @@ def main(session):
                 if open_spec:
                     console.print(f"[dim]OpenSpec: {open_spec.render()}[/dim]")
 
-            # ── Auto-read files mentioned in edit/coding prompts ──────────────
+            # ── Empty Workspace Bootstrap Check ──────────────
+            _all_files_check = list_files().stdout.splitlines()
+            _visible_files = [f for f in _all_files_check if not any(part.startswith('.') for part in f.replace('\\', '/').split('/'))]
+            if not _visible_files:
+                worker_history.append({
+                    "role": "system",
+                    "content": "There are currently no project files. Assume you are creating a new project. Do not attempt read_file unless the user explicitly references an existing file. Missing parent directories will be created automatically by write_file."
+                })
+
+            # ── Auto-read files and preload dependencies ──────────────
             _AUTO_READ_ACTIONS = [
                 "improve", "update", "edit", "enhance", "redesign", "rewrite",
                 "change", "modify", "fix", "refactor",
@@ -527,39 +529,97 @@ def main(session):
                 )
                 _mentioned = _file_pat.findall(user_input)
                 
-                if _mentioned:
-                    _all_files = list_files().stdout.splitlines()
+                _all_files = list_files().stdout.splitlines() if _mentioned else []
+                to_read = set()
                     
-                for _base, _ext in _mentioned[:2]:  # cap at 2 files
+                for _base, _ext in _mentioned[:2]:  # cap at 2 root files
                     _f_name = f"{_base}.{_ext}"
                     _fpath = _f_name
-                    
                     if not _os.path.exists(_fpath):
-                        # Find all matching paths in list_files() output
                         _matches = [p for p in _all_files if p.endswith(_f_name) or _f_name in p]
                         if _matches:
-                            # Pick the shortest path (closest to root)
                             _fpath = min(_matches, key=len)
-                            
+                    to_read.add(_fpath)
+
+                _preloaded = set()
+                while to_read and len(_preloaded) < 5: # max 5 files to prevent context bloat
+                    _fpath = to_read.pop()
+                    if not _os.path.exists(_fpath): continue
+                    
                     _norm = normalize_path(_fpath)
-                    if _norm not in exec_state.files_read:
-                        res = read_file(_fpath)
-                        if res.success:
-                            console.print(f"[dim]Auto-read: {_fpath}[/dim]")
-                            exec_state.files_read.add(_norm)
-                            worker_history.append({
-                                "role": "user",
-                                "content": f"FILE CONTENTS ({_fpath}):\n{res.stdout}\n\nI have automatically read this file for you. Do NOT call read_file for it. Use this content to immediately begin planning your edits, or call write_file/replace_chunk to apply them."
-                            })
+                    if _norm in exec_state.files_read: continue
+                    
+                    res = read_file(_fpath)
+                    if res.success:
+                        console.print(f"[dim]Preloaded dependency: {_fpath}[/dim]")
+                        exec_state.files_read.add(_norm)
+                        _preloaded.add(_norm)
+                        
+                        worker_history.append({
+                            "role": "user",
+                            "content": f"FILE CONTENTS ({_fpath}):\n{res.stdout}\n\nI have automatically read this file for you. Do NOT call read_file for it."
+                        })
+                        
+                        # Extract relationships
+                        resolved_deps = _parse_dependencies(_fpath, res.stdout, _all_files)
+                        for _d_path in resolved_deps:
+                            exec_state.file_relationships.setdefault(_norm, set()).add(_d_path)
+                            to_read.add(_d_path)
 
             # Mode Management
             worker_mode = "execute"
             all_tools_executed = set()
             
-            while passes < max_passes and tool_loops < max_tool_loops:
+            from core.post_tool_validator import update_scheduler_state, RequirementStatus
+            from core.planner import generate_plan
+            last_failed_validation_msg = ""
+            last_tool_batch_results = []
+            
+            while True:
                 if metrics.reasoning_passes >= metrics.max_reasoning_passes:
                     console.print("[red]Maximum reasoning passes reached. Emergency stop.[/red]")
                     break
+
+
+                # 2. VALIDATE & SCHEDULE
+                is_finished = False
+                prompt_injection_msg = ""
+                if exec_state.task_type == "coding":
+                    import time
+                    _v_start = time.time()
+                    is_finished, prompt_injection_msg = update_scheduler_state(exec_state)
+                    metrics.validation_time += (time.time() - _v_start)
+
+                if is_finished and exec_state.task_type == "coding":
+                    console.print("[dim]Execution complete. Generating final response...[/dim]")
+                    worker_mode = "respond"
+                
+                # Retrieve active req for telemetry
+                from core.execution_state import RequirementStatus
+                active_req = next((r for r in exec_state.requirements if r.status == RequirementStatus.ACTIVE), None)
+                if active_req:
+                    active_req.reasoning_calls += 1
+                
+                # 3. BUILD STATELESS WORKER PROMPT
+                worker_history = []
+                
+                # A. Inject file snapshots (Project Facts)
+                facts = ["PROJECT FACTS (File Cache):"]
+                for path, snap in exec_state.file_cache.items():
+                    if snap.exists:
+                        facts.append(f"--- {path} ---\n{snap.content}")
+                if len(facts) > 1:
+                    worker_history.append({"role": "user", "content": "\n".join(facts)})
+                    
+                # B. Inject Active Requirement
+                if prompt_injection_msg:
+                    worker_history.append({"role": "user", "content": prompt_injection_msg})
+                    
+                # C. Inject Immediate Context (Tool Results OR Validation Error)
+                if last_tool_batch_results:
+                    worker_history.append({"role": "user", "content": "\n".join(last_tool_batch_results)})
+                if last_failed_validation_msg:
+                    worker_history.append({"role": "user", "content": last_failed_validation_msg})
 
                 prompt_size  = sum(len(m.get("content", "")) for m in worker_history)
                 context_size = len(full_context or "")
@@ -608,6 +668,8 @@ def main(session):
                             else:
                                 console.print(chunk, end="", style="dim", markup=False)
 
+                    metrics.worker_time += (time.time() - call_start)
+
                     # ── Parse Strict JSON ─────────────────────────────────────
                     parsed_response = None
                     try:
@@ -633,41 +695,56 @@ def main(session):
                             console.print("[dim]Worker produced an invalid response. Retrying...[/dim]")
                         
                     if not parsed_response:
-                        parse_fail_count += 1
-                        if parse_fail_count >= 3:
-                            console.print("[red]Worker failed to produce valid JSON after 3 attempts. Aborting task.[/red]")
+                        metrics.parse_retries += 1
+                        if metrics.parse_retries >= 5:
+                            console.print("[red]Worker failed to produce valid JSON after 5 attempts. Aborting task.[/red]")
                             response_content = "[Task aborted due to malformed worker output]"
                             break
 
-                        worker_history.append({"role": "assistant", "content": raw_response})
-                        worker_history.append({
-                            "role": "user",
-                            "content": (
-                                "Your response must be exactly one JSON object. "
-                                "No markdown, no prose, no code blocks."
-                            )
-                        })
-                        tool_loops += 1
-                        metrics.record_retry()
-                        continue  # Validator is NOT reached — parsed_response is falsy
+                        last_failed_validation_msg = "Validation failed: Your response must be exactly one JSON object. No markdown, no prose, no code blocks."
+                        continue  # Rebuild prompt and retry
 
                     parsed_responses = parsed_response if isinstance(parsed_response, list) else [parsed_response]
-                    parse_fail_count = 0  # reset on successful parse
                     
                     has_final = any(isinstance(pr, dict) and pr.get('type') == 'final' for pr in parsed_responses)
                     if has_final:
                         # ── Strict Completion Verification ──
-                        # NOTE: This block is only reachable after a successful parse.
-                        # Parse failures hit `continue` above and never reach here.
-                        passed, instruction = validate_post_tool(exec_state)
+                        # NOTE: Since we already check completion at the TOP of the loop,
+                        # if the worker says "final" but we aren't finished, they are hallucinating.
+                        passed = is_finished or not exec_state.requirements
+                        validation_success = passed
                         
                         if not passed:
-                            console.print(f"[yellow]Validator rejected completion: {instruction}[/yellow]")
-                            worker_history.append({"role": "assistant", "content": raw_response})
-                            worker_history.append({"role": "user", "content": f"Validation failed: {instruction}. You must use tools to satisfy the contract before declaring final."})
-                            tool_loops += 1
-                            metrics.record_retry()
-                            continue
+                            update_scheduler_state(exec_state, final_declared=True)
+                            
+                            # Explicitly reactivate the failed requirement for retry
+                            failed_req = next((r for r in exec_state.requirements if r.status == RequirementStatus.FAILED), None)
+                            if failed_req:
+                                failed_req.status = RequirementStatus.ACTIVE
+                                
+                                instruction = "Task Requirements not fully met."
+                                console.print(f"[yellow]Validator rejected completion: {instruction}[/yellow]")
+                                last_failed_validation_msg = f"Validation failed: {instruction}. You must use tools to satisfy the contract before declaring final."
+                                last_tool_batch_results = []
+                                metrics.validation_retries += 1
+                                if active_req:
+                                    active_req.validator_failures += 1
+                                    
+                                    if active_req.tool_calls == 0 and active_req.validator_failures >= 1:
+                                        console.print(f"[red]PLANNER_CONTRACT_ERROR: Worker refuses to execute tools for {active_req.type}. Aborting.[/red]")
+                                        response_content = f"PLANNER_CONTRACT_ERROR: Planner emitted impossible workflow. Worker executed 0 tools for {active_req.type}."
+                                        task_completed = True
+                                        validation_success = False
+                                        termination_reason = "PLANNER_CONTRACT_ERROR"
+                                        break
+                                        
+                                    if active_req.validator_failures >= 3:
+                                        console.print(f"[red]Requirement {active_req.id} failed validation 3 times. Aborting task.[/red]")
+                                        response_content = f"Failed to satisfy requirement: {active_req.type} {active_req.args.get('path', '')} after 3 attempts. Aborting."
+                                        task_completed = True
+                                        validation_success = False
+                                        break
+                                continue
                             
                         all_tools = {evt.tool for evt in exec_state.tool_events}
                         read_only_tools = {"read_file", "list_files"}
@@ -693,8 +770,10 @@ def main(session):
                         continue
                     has_tool_call = any(isinstance(pr, dict) and pr.get('type') == 'tool_call' for pr in parsed_responses)
                     if has_tool_call:
-                        worker_history.append({'role': 'assistant', 'content': raw_response})
                         last_tools_executed = []
+                    
+                    # Clear out the validation message since we successfully parsed a tool/final request
+                    last_failed_validation_msg = ""
                     batch_results = []
                     any_failed = False
                     for pr in parsed_responses:
@@ -703,8 +782,10 @@ def main(session):
                         resp_type = parsed_response.get('type')
 
 
-                        if resp_type == "tool_call" and tool_loops < max_tool_loops:
+                        if resp_type == "tool_call" and metrics.tool_calls < metrics.max_tool_calls:
                             metrics.tool_calls += 1
+                            if active_req:
+                                active_req.tool_calls += 1
                             raw_tool_name = parsed_response.get("tool")
                             tool_name = TOOL_ALIASES.get(raw_tool_name, raw_tool_name)
                             last_tools_executed.append(tool_name)
@@ -715,11 +796,13 @@ def main(session):
                             session.log(f"TOOL: {tool_name}({args})")
 
                             # ── 🛑 Hard Stop Guards (Abort Batch on invalid tools) ──
-                            VALID_TOOLS = {"read_file", "write_file", "replace_chunk", "patch_file", "list_files", "search_index", "run_command"}
-                            if tool_name not in VALID_TOOLS:
-                                err_msg = f"Error: Unknown tool '{tool_name}'"
+                            from core.tool_registry import VALID_TOOLS, ALL_WORKER_TOOLS
+                            if tool_name not in ALL_WORKER_TOOLS:
+                                err_msg = f"Error: Unknown tool '{tool_name}'. Valid tools are: {', '.join(ALL_WORKER_TOOLS)}. Remember: Use correct tool names exactly as listed."
                                 console.print(f"[red]{err_msg}[/red]")
                                 batch_results.append(json.dumps({"success": False, "tool": tool_name, "stderr": err_msg}, indent=2))
+                                exec_state.hallucinated_tool_count += 1
+                                exec_state.hallucinated_tool_names.append(tool_name)
                                 any_failed = True
                                 break  # Do NOT execute follow-up steps in this batch
 
@@ -773,28 +856,96 @@ def main(session):
                                 if tool_name == "read_file":
                                     tool_res = read_file(raw_path)
                                     if tool_res.success:
+                                        exec_state.update_snapshot(raw_path, tool_res.stdout, True, metrics.reasoning_passes)
                                         exec_state.files_read.add(norm_path)
                                         
                                 elif tool_name == "write_file" and not task_completed:
-                                    new_content = args.get("content", "").strip()
-                                    tool_res = write_file(raw_path, new_content)
-                                    if tool_res.success:
-                                        exec_state.files_written.add(norm_path)
-                                        try:
-                                            update_file_index(session, raw_path)
-                                        except Exception:
-                                            pass
+                                    if norm_path not in exec_state.files_read and os.path.exists(raw_path):
+                                        res = read_file(raw_path)
+                                        if res.success:
+                                            exec_state.files_read.add(norm_path)
+                                            tool_res = ToolResult(
+                                                success=False,
+                                                stdout="",
+                                                summary="Auto-read file before edit",
+                                                status="interrupted",
+                                                error=f"FILE CONTENTS:\n{res.stdout}\n\nI automatically read this file because you tried to edit it blindly. Review the contents and emit your edit again."
+                                            )
+                                        else:
+                                            tool_res = res
+                                    else:
+                                        created = not os.path.exists(raw_path)
+                                        args["created"] = created
+                                        new_content = args.get("content", "").strip()
+                                        tool_res = write_file(raw_path, new_content)
+                                        if tool_res.success:
+                                            exec_state.update_snapshot(raw_path, new_content, True, metrics.reasoning_passes)
+                                            
+                                            try:
+                                                update_file_index(session, raw_path)
+                                                # Post-write dependency reparsing
+                                                _post_res = read_file(raw_path)
+                                                if _post_res.success:
+                                                    _all_fs = list_files().stdout.splitlines()
+                                                    _new_deps = _parse_dependencies(raw_path, _post_res.stdout, _all_fs)
+                                                    exec_state.file_relationships[norm_path] = set(_new_deps)
+                                            except Exception:
+                                                pass
 
                                 elif tool_name == "replace_chunk":
-                                    target  = args.get("target_code", "")
-                                    replace = args.get("replacement_code", "").strip()
-                                    tool_res = replace_chunk(raw_path, target, replace, content_signatures)
-                                    if tool_res.success:
-                                        exec_state.files_written.add(norm_path)
-                                        try:
-                                            update_file_index(session, raw_path)
-                                        except Exception:
-                                            pass
+                                    if norm_path not in exec_state.files_read and os.path.exists(raw_path):
+                                        res = read_file(raw_path)
+                                        if res.success:
+                                            exec_state.files_read.add(norm_path)
+                                            tool_res = ToolResult(
+                                                success=False,
+                                                stdout="",
+                                                summary="Auto-read file before edit",
+                                                status="interrupted",
+                                                error=f"FILE CONTENTS:\n{res.stdout}\n\nI automatically read this file because you tried to edit it blindly. Review the contents and emit your edit again."
+                                            )
+                                        else:
+                                            tool_res = res
+                                    else:
+                                        target  = args.get("target_code", "")
+                                        replace = args.get("replacement_code", "").strip()
+                                        tool_res = replace_chunk(raw_path, target, replace, content_signatures)
+                                        if tool_res.success:
+                                            # We need to read the new full content to snapshot it
+                                            _post_res = read_file(raw_path)
+                                            if _post_res.success:
+                                                exec_state.update_snapshot(raw_path, _post_res.stdout, True, metrics.reasoning_passes)
+                                            
+                                            try:
+                                                update_file_index(session, raw_path)
+                                                # Post-write dependency reparsing
+                                                _post_res = read_file(raw_path)
+                                                if _post_res.success:
+                                                    _all_fs = list_files().stdout.splitlines()
+                                                    _new_deps = _parse_dependencies(raw_path, _post_res.stdout, _all_fs)
+                                                    exec_state.file_relationships[norm_path] = set(_new_deps)
+                                            except Exception:
+                                                pass
+                                                pass
+
+                                elif tool_name == "delete_file":
+                                    from tools.delete_file import delete_file as df_tool
+                                    try:
+                                        res_dict = df_tool(raw_path)
+                                        from tools.run_command import ToolResult
+                                        tool_res = ToolResult(
+                                            success=res_dict["success"],
+                                            stdout=res_dict["stdout"],
+                                            stderr=res_dict["stderr"],
+                                            summary=res_dict["summary"],
+                                            status=res_dict["status"]
+                                        )
+                                        if tool_res.success:
+                                            # We deleted it, remove from read cache if present
+                                            exec_state.files_read.discard(norm_path)
+                                    except Exception as e:
+                                        from tools.run_command import ToolResult
+                                        tool_res = ToolResult(success=False, stdout="", stderr=str(e), summary=str(e), status="failed")
 
                                 elif tool_name == "list_files":
                                     tool_res = list_files()
@@ -807,31 +958,52 @@ def main(session):
                                 elif tool_name == "run_command":
                                     cmd = args.get("command", "").strip()
                                     
-                                    # Duplicate command guard
-                                    last_run = next((e for e in reversed(exec_state.tool_events) if e.tool == "run_command"), None)
-                                    if last_run and last_run.args.get("command", "").strip() == cmd:
-                                        tool_res = ToolResult(
-                                            success=False,
-                                            stdout="",
-                                            stderr="DUPLICATE COMMAND GUARD TRIPPED: You just ran this exact command. If it succeeded and no further action is needed, output a 'final' response. Do not repeat identical commands.",
-                                            summary="Duplicate command blocked."
-                                        )
-                                    else:
-                                        tool_res = run_command(cmd, session.root)
-                                        if tool_res.success:
-                                            exec_state.commands_run.append(cmd)
+                                    # Auto-read injection for execution
+                                    import re
+                                    exec_script = re.search(r'^(?:python|node|bash|sh)\s+([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)', cmd)
+                                    if exec_script:
+                                        script_path = exec_script.group(1)
+                                        norm_script = normalize_path(script_path)
+                                        if norm_script not in exec_state.files_read and os.path.exists(script_path):
+                                            res = read_file(script_path)
+                                            if res.success:
+                                                exec_state.files_read.add(norm_script)
+                                                tool_res = ToolResult(
+                                                    success=False,
+                                                    stdout="",
+                                                    summary="Auto-read script before execution",
+                                                    status="interrupted",
+                                                    error=f"FILE CONTENTS:\n{res.stdout}\n\nI automatically read this script because you tried to execute it blindly. Review the contents and emit your run_command again if appropriate."
+                                                )
+                                                # Bypass normal execution
+                                                cmd = ""
+                                                
+                                    if cmd:
+                                        # Duplicate command guard
+                                        last_run = next((e for e in reversed(exec_state.tool_events) if e.tool == "run_command"), None)
+                                        if last_run and last_run.args.get("command", "").strip() == cmd:
+                                            tool_res = ToolResult(
+                                                success=False,
+                                                stdout="",
+                                                stderr="DUPLICATE COMMAND GUARD TRIPPED: You just ran this exact command. If it succeeded and no further action is needed, output a 'final' response. Do not repeat identical commands.",
+                                                summary="Duplicate command blocked."
+                                            )
+                                        else:
+                                            tool_res = run_command(cmd, session.root)
+                                            if tool_res.success:
+                                                exec_state.commands_run.append(cmd)
 
                                 else:
                                     # This should never be reached due to VALID_TOOLS guard, but kept for safety
                                     tool_res = ToolResult(success=False, stdout="", stderr=f"Error: Unknown tool '{tool_name}'", summary="Unknown tool")
 
-                            except BaseException as e:
-                                is_interrupt = isinstance(e, KeyboardInterrupt)
-                                err_msg = "Process interrupted by user (Ctrl+C)." if is_interrupt else f"Tool Execution Error: {e}"
-                                status_str = "interrupted" if is_interrupt else "failed"
+                            except KeyboardInterrupt:
+                                raise
+                            except Exception as e:
+                                err_msg = f"Tool Execution Error: {e}"
                                 tool_res = ToolResult(
                                     success=False,
-                                    status=status_str,
+                                    status="failed",
                                     stdout="",
                                     stderr=err_msg,
                                     summary=err_msg
@@ -839,6 +1011,7 @@ def main(session):
 
                             finally:
                                 end_time = time.time()
+                                metrics.tool_time += (end_time - start_time)
                                 if tool_res is None:
                                     tool_res = ToolResult(success=False, status="failed", stdout="", stderr="Tool failed to return a result.", summary="Unknown error")
 
@@ -859,12 +1032,6 @@ def main(session):
                                 tool_result_dict["stdout"] = tool_res.stdout
                                 tool_result_dict["stderr"] = tool_res.stderr
 
-                            last_tool_metadata = {
-                                "tool": tool_name,
-                                "success": tool_result_dict["success"],
-                                "path": raw_path if raw_path else args.get("command", "")
-                            }
-
                             combined_result_str = json.dumps(tool_result_dict, indent=2)
                             console.print(f"[dim]Tool Result: {len(combined_result_str)} chars[/dim]")
 
@@ -881,18 +1048,11 @@ def main(session):
                             last_tools_failed = True
 
                     if batch_results:
-                        if tool_loops >= max_tool_loops - 1:
-                            instruction = "TOOL LOOP LIMIT REACHED. You must now produce the final user-facing answer in plain text. Do NOT emit any more tool calls."
-                        else:
-                            instruction = "Here are the tool results. If you need more information, you may use another tool. Otherwise, produce the final user-facing answer."
+                        instruction = "Here are the tool results. If you need more information, you may use another tool. Otherwise, produce the final user-facing answer."
                         
-                        worker_history.append({
-                            'role': 'user',
-                            'content': '\n\n'.join(batch_results) + f'\n\n{instruction}'
-                        })
+                        last_tool_batch_results = batch_results + [instruction]
                         if any_failed:
-                            worker_history.append({'role': 'user', 'content': 'Some tool calls failed. Correct and retry.'})
-                        tool_loops += 1
+                            last_tool_batch_results.append('Some tool calls failed. Correct and retry.')
                         metrics.record_retry()
                         continue
 
@@ -920,6 +1080,7 @@ def main(session):
             unload_active_models()
 
         except ResourceSafetyError as e:
+            termination_reason = "RESOURCE_LIMIT"
             console.print(f"\n{e}\n", markup=False)
             metrics.resource_failures += 1
             watchdog.wait_for_cooldown()
@@ -927,15 +1088,38 @@ def main(session):
             from systems.ollama_client import unload_active_models
             unload_active_models()
         except RuntimeError as e:
+            termination_reason = "UNHANDLED_EXCEPTION"
             console.print("[bold yellow]Agent Error:[/bold yellow] ", end="")
             console.print(str(e), markup=False, highlight=False)
         except (KeyboardInterrupt, EOFError, StopIteration):
+            termination_reason = "USER_INTERRUPT"
             console.print("\n[yellow]Interrupted.[/yellow]")
             break
         except Exception as e:
+            termination_reason = "UNHANDLED_EXCEPTION"
             logger.critical(f"Unexpected error: {e}", exc_info=True)
             console.print("[bold red]Unexpected Error:[/bold red] ", end="")
             console.print(str(e), markup=False, highlight=False)
+        finally:
+            # Record Telemetry even if crashed
+            if exec_state and task_start_time:
+                try:
+                    import time
+                    from core.telemetry import record_task
+                    from config import PLANNER_MODEL, WORKER_MODEL
+                    task_duration = time.time() - task_start_time
+                    models_used = {"planner": PLANNER_MODEL, "worker": WORKER_MODEL}
+                    
+                    record_task(
+                        exec_state=exec_state,
+                        task_duration=task_duration,
+                        metrics=metrics,
+                        validation_success=locals().get("validation_success", False),
+                        models=models_used,
+                        termination_reason=termination_reason
+                    )
+                except Exception as e:
+                    console.print(f"[dim yellow]Telemetry recording failed: {e}[/dim yellow]")
 
 
 if __name__ == "__main__":

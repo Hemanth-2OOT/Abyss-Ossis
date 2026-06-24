@@ -14,7 +14,16 @@ class MetricsTracker:
         self.reasoning_passes = 0
         self.tool_calls = 0
         self.llm_calls = 0
+        self.parse_retries = 0
+        self.validation_retries = 0
+        self.tool_hallucination_retries = 0
+        self.planner_regenerations = 0
         self.resource_failures = 0
+        
+        self.planner_time = 0.0
+        self.worker_time = 0.0
+        self.tool_time = 0.0
+        self.validation_time = 0.0
         
         # Tools executed
         self.observability_history_log = []
@@ -51,6 +60,9 @@ class MetricsTracker:
             "\n[bold cyan]─── turn execution metrics ───[/bold cyan]",
             f"  [bold white]Reasoning Passes:[/bold white] {self.reasoning_passes}/{self.max_reasoning_passes}",
             f"  [bold white]Tool Calls:[/bold white]       {self.tool_calls}/{self.max_tool_calls}",
+            f"  [bold white]Planner Retries:[/bold white]  {self.planner_regenerations}",
+            f"  [bold white]Parse Retries:[/bold white]    {self.parse_retries}",
+            f"  [bold white]Validation Fails:[/bold white] {self.validation_retries}",
             f"  [bold white]LLM API Calls:[/bold white]    {self.llm_calls}",
             f"  [bold white]Prompt/Context:[/bold white]   ~{context_size} chars",
             f"  [bold white]Tools Triggered:[/bold white]  {', '.join(self.observability_history_log) if self.observability_history_log else 'none'}",

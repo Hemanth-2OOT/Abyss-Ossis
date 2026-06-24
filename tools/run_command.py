@@ -3,7 +3,14 @@ import subprocess
 import time
 from core.tool_result import ToolResult
 
-
+def _cleanup_proc(proc: subprocess.Popen):
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        
 def run_command(cmd: str, cwd: str, timeout: int = 30) -> ToolResult:
     """
     Executes a shell command securely and safely, returning a ToolResult.
@@ -83,10 +90,11 @@ def run_command(cmd: str, cwd: str, timeout: int = 30) -> ToolResult:
             is_server_mode = (proc.poll() is None)
             
             if is_server_mode:
-                # Still running after 6 s -> terminate and check status
-                proc.terminate()
-                proc.wait(timeout=3)
+                _cleanup_proc(proc)
                 stdout, stderr = proc.communicate()
+                
+                if proc.stdout: proc.stdout.close()
+                if proc.stderr: proc.stderr.close()
                 
                 return ToolResult(
                     success=True,
@@ -98,6 +106,10 @@ def run_command(cmd: str, cwd: str, timeout: int = 30) -> ToolResult:
                 )
             else:
                 stdout, stderr = proc.communicate()
+                
+                if proc.stdout: proc.stdout.close()
+                if proc.stderr: proc.stderr.close()
+                
                 success = (proc.returncode == 0)
                 status = "completed" if success else "failed"
                 return ToolResult(
@@ -107,14 +119,15 @@ def run_command(cmd: str, cwd: str, timeout: int = 30) -> ToolResult:
                     stderr=f"Exit code {proc.returncode}\n{stderr}" if not success else stderr,
                     summary=f"Process exited early with code {proc.returncode} (status: {status})"
                 )
-        except BaseException as e:
-            is_interrupt = isinstance(e, KeyboardInterrupt)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
             return ToolResult(
                 success=False,
-                status="interrupted" if is_interrupt else "failed",
+                status="failed",
                 stdout="",
-                stderr="Process interrupted by user (Ctrl+C)." if is_interrupt else f"Server failed to launch cleanly: {e}",
-                summary="Process interrupted." if is_interrupt else "Exception during server launch."
+                stderr=f"Server failed to launch cleanly: {e}",
+                summary="Exception during server launch."
             )
 
     # ── Short Running Synchronous Command ─────────────────────────────────────
@@ -145,12 +158,13 @@ def run_command(cmd: str, cwd: str, timeout: int = 30) -> ToolResult:
             stderr=f"Command timed out after {timeout} seconds.",
             summary="Command timeout."
         )
-    except BaseException as e:
-        is_interrupt = isinstance(e, KeyboardInterrupt)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
         return ToolResult(
             success=False,
-            status="interrupted" if is_interrupt else "failed",
+            status="failed",
             stdout="",
-            stderr="Process interrupted by user (Ctrl+C)." if is_interrupt else f"Exception executing command: {e}",
-            summary="Process interrupted." if is_interrupt else "Execution exception."
+            stderr=f"Exception executing command: {e}",
+            summary="Execution exception."
         )

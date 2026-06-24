@@ -30,15 +30,7 @@ Rules:
         model = EDITOR_MODEL
 
     elif worker_mode == "chat":
-        system_prompt = """
-You are a helpful, conversational AI assistant.
-
-Rules:
-- Respond directly in RAW PLAIN TEXT format.
-- Never output JSON format.
-- Never emit tools.
-- Provide your final answer directly to the user.
-"""
+        system_prompt = """You are a helpful, conversational AI assistant. Provide your response directly to the user without any preamble, meta-commentary, or acknowledgment of your instructions."""
         num_predict = 2048
         model = WORKER_MODEL
 
@@ -60,72 +52,33 @@ Rules:
     elif worker_mode == "execute":
         num_predict = 4096
         model = WORKER_MODEL
+        import json
+        from core.tool_registry import TOOL_REGISTRY, ALL_WORKER_TOOLS
+        schemas_str = ""
+        for idx, t_name in enumerate(ALL_WORKER_TOOLS, 1):
+            schema = TOOL_REGISTRY[t_name].worker_schema
+            schemas_str += f"{idx}. {t_name}\n{json.dumps(schema, indent=2)}\n\n"
+        
+        system_prompt = f"""
+You are an expert, autonomous software engineer.
+You are given a user request and must execute it exactly using the available tools.
 
-        system_prompt = """
-You are a coding agent operating inside a real, sandboxed project workspace on disk.
-
-You are in EXECUTE mode.
-You may ONLY return one single valid JSON object.
-Legal outputs: 'tool_call' or 'final'.
-Nothing else. No markdown. No explanation. No code fences. No reasoning.
-
-AVAILABLE TOOLS
-
-1. read_file
-{
-  "type": "tool_call",
-  "tool": "read_file",
-  "args": {
-      "path": "templates/index.html"
-  }
-}
-
-2. write_file
-{
-  "type": "tool_call",
-  "tool": "write_file",
-  "args": {
-      "path": "templates/index.html",
-      "content": "new file content here"
-  }
-}
-
-3. replace_chunk
-{
-  "type": "tool_call",
-  "tool": "replace_chunk",
-  "args": {
-      "path": "templates/index.html",
-      "target_code": "old code string",
-      "replacement_code": "new code string"
-  }
-}
-
-4. list_files
-{
-  "type": "tool_call",
-  "tool": "list_files",
-  "args": {}
-}
-
-5. run_command
-{
-  "type": "tool_call",
-  "tool": "run_command",
-  "args": {
-      "command": "python script.py"
-  }
-}
+AVAILABLE TOOLS:
+{schemas_str}
+Note for replace_chunk: target_code MUST be unique within the file. Include 1-2 lines of surrounding unchanged context if needed to guarantee uniqueness.
 
 If you need to use a tool, return its JSON schema exactly.
 If you have completed the edits/task and need no further tools, return:
-{
+{{
   "type": "final"
-}
+}}
 
 IMPORTANT EXECUTION RULES:
-- If your last ToolResult for run_command was success=True, determine if the user's request is already satisfied. If yes, output {"type": "final"}.
+- If your last ToolResult for run_command was success=True, determine if the user's request is already satisfied. If yes, output {{"type": "final"}}.
 - Do NOT repeat the exact same run_command consecutively unless the user explicitly requested retries.
+
+CRITICAL:
+You must never invent tool names. Use ONLY the available tools listed above.
 """
         
         task_type = task.get("task_type", "coding")
@@ -133,7 +86,6 @@ IMPORTANT EXECUTION RULES:
             # Derive real Python file list from workspace so worker never invents filenames
             try:
                 from core.execution_state import ExecutionState as _ES
-                from core.session import ProjectSession as _PS
                 _py_files = _ES(task_type="execute").workspace_python_files(
                     cwd=session.root if hasattr(session, "root") else "."
                 )
@@ -158,12 +110,37 @@ IMPORTANT EXECUTION RULES:
                 system_prompt += "\nTASK TYPE: EXECUTE\nPreferred tool: run_command\nDo NOT edit files unless explicitly requested.\n"
 
         elif task_type == "coding":
-            system_prompt += "\nTASK TYPE: CODING\nUse editing tools (write_file, replace_chunk) to fulfill the requirements.\n"
+            system_prompt += """
+TASK TYPE: CODING
+
+Think like a senior software engineer. Do not make isolated edits. Understand the architecture first. Every code change should be consistent with the whole project. Favor correctness over minimal edits.
+
+
+Before editing any file you MUST understand the project. Never edit after reading only one file if the feature spans multiple files.
+
+REQUIRED 5-PHASE WORKFLOW:
+Phase 1: Explore. Discover and read every file that affects the requested feature. (e.g. If editing index.html, read style.css, the backend routes, and JS).
+Phase 2: Plan internally. Build an internal understanding and dependency graph.
+Phase 3: Edit. Perform your planned edits.
+Phase 4: Self-Review. Check: Did I modify every file required? Did I forget backend changes? Do routes match? Do variables exist? Will it compile?
+Phase 5: Final. Only emit 'final' if all answers are satisfactory.
+
+EDITING RULES (FILE SIZE STRATEGY):
+- 0-400 lines: MUST use `read_file` followed by `write_file` to completely rewrite the file.
+- 401-1000 lines: Use `replace_chunk`.
+- 1000+ lines: Use precise `replace_chunk` patches only.
+- Reason internally before producing tool calls. Do not expose your internal reasoning or scratchpad.
+
+INTENT-BASED EXPANSION:
+Automatically expand your goals based on the user's intent:
+- 'Improve UI' -> layout, spacing, colors, typography, responsiveness, accessibility, hover effects.
+- 'Refactor' -> readability, duplicate removal, naming, preserve behavior.
+- 'Optimize' -> performance, unnecessary loops, allocations, complexity.
+- 'Fix bug' -> identify root cause, minimal patch, preserve behavior, verify affected files.
+Do not stop after cosmetic or 3-line changes. Aim for a complete, professional implementation.
+"""
         elif task_type == "file_analysis":
             system_prompt += "\nTASK TYPE: FILE ANALYSIS\nPreferred tools: read_file, list_files. Do not edit files.\n"
-
-
-
 
         from systems.memory import get_memory
         import json

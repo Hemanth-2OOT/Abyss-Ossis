@@ -93,7 +93,8 @@ def classify_task(user_input):
 
     coding_words = ["build", "create", "write", "make", "implement", "code", "generate",
                     "improve", "update", "edit", "enhance", "redesign", "rewrite",
-                    "change", "add", "modify", "extend", "upgrade"]
+                    "change", "add", "modify", "extend", "upgrade",
+                    "delete", "remove", "rename", "move"]
     debug_words = ["bug", "fix", "error", "traceback", "failing", "crash", "broken"]
     analysis_words = ["architecture", "layout", "structure", "explain how", "fit together"]
 
@@ -109,7 +110,7 @@ def classify_task(user_input):
     elif any(w in text for w in coding_words):
         task = {
             "task_type": "coding",
-            "needs_planner": score >= 2,
+            "needs_planner": True,
             "needs_tools": True,
             "needs_retrieval": False
         }
