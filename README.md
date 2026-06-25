@@ -1,4 +1,4 @@
-# ABYSS OSSIS — Complete Guide (v1.0)
+# ABYSS OSSIS — Complete Guide (v2.0)
 
 > A local-first, zero-cost AI coding agent powered by Qwen 2.5 Coder 7B.
 > Works like Claude Code / Cursor — but runs entirely on your machine.
@@ -16,10 +16,8 @@
 5. [All Commands](#all-commands)
 6. [Autonomous Tool Calls](#autonomous-tool-calls)
 7. [File Editing & Security](#file-editing--security)
-8. [Project Memory](#project-memory)
-9. [Project Isolation](#project-isolation)
-10. [Codebase Structure](#codebase-structure)
-11. [Troubleshooting](#troubleshooting)
+8. [Project Memory & Sandboxing](#project-memory--sandboxing)
+9. [Codebase Structure](#codebase-structure)
 
 ---
 
@@ -86,9 +84,9 @@ You can immediately start typing natural language requests.
 
 ## How It Works (Execution Architecture)
 
-Abyss Ossis uses a highly deterministic, multi-phase execution loop designed to extract reliable tool usage from small (7B) local models.
+Abyss Ossis uses a highly deterministic, multi-phase execution loop designed to extract reliable tool usage from small (7B) local models without infinite looping or context collapse.
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                        YOU TYPE                             │
 │               "run the backend and fix the UI"              │
@@ -102,38 +100,45 @@ Abyss Ossis uses a highly deterministic, multi-phase execution loop designed to 
                           │
                           ▼
               ┌────────────────────────┐
-              │   WORKER (EXECUTE)     │  Generates strictly JSON tools.
-              │  (streams <think>      │  Injects real workspace context
-              │   blocks securely)     │  so it doesn't hallucinate paths.
+              │       PLANNER          │  Breaks task into sequential
+              │   (Generates JSON      │  Tool Requirements (R1, R2, R3).
+              │   Execution Graph)     │  Avoids blind model guesswork.
               └───────────┬────────────┘
                           │
                           ▼
               ┌────────────────────────┐
-              │    TOOL DISPATCHER     │  Executes tool logic securely.
-              │  Records ToolEvents    │  Hard-aborts batch on unknown/
-              │  to ExecutionState     │  illegal tools.
+              │   WORKER (EXECUTE)     │  Executes strictly defined tools.
+              │  (Streams JSON tools   │  Maintains Context Memory of past
+              │   within execution)    │  tool results to prevent amnesia.
               └───────────┬────────────┘
                           │
                           ▼
               ┌────────────────────────┐
-              │ POST-TOOL VALIDATOR    │  Checks ExecutionState against
-              │  (Did the task meet    │  declarative Task Contracts.
-              │   its requirements?)   │  If not, auto-retries worker.
+              │    TOOL DISPATCHER     │  Executes tool logic safely.
+              │  Catches invalid tools │  Auto-heals missing modules via
+              │  and injects feedback. │  automatic `pip install` detection.
               └───────────┬────────────┘
                           │
                           ▼
               ┌────────────────────────┐
-              │   WORKER (RESPOND)     │  Fed purely the factual transcript
-              │  Generates final prose │  (files read, edited, commands).
-              │  summary for the user. │  Zero hallucination.
+              │ POST-TOOL VALIDATOR    │  Tracks RequirementStatus state.
+              │  (Did the task meet    │  Validates physical OS-level
+              │   its requirements?)   │  changes. Blocks hallucinations.
+              └───────────┬────────────┘
+                          │
+                          ▼
+              ┌────────────────────────┐
+              │   WORKER (RESPOND)     │  Fed purely the proven factual
+              │  Generates final prose │  transcript. Zero hallucination.
+              │  summary for the user. │  
               └────────────────────────┘
 ```
 
 **Key Innovations:**
-- **`ExecutionState`**: The single source of truth. Every executed tool records a `ToolEvent` (args, success status, output).
-- **The 3-Layer Truth Model**: Execution cleanly separates OS truth (`returncode`), semantic completeness (`success = returncode == 0`), and runtime state (`status = "completed" | "running" | "failed"`). A server can be "running" but not semantically "completed" until explicitly verified.
-- **`TaskContracts`**: A coding task isn't "complete" just because the LLM says `"type": "final"`. The validator checks `ExecutionState` to prove that a file was *actually* edited or a command explicitly returned code 0 before accepting completion.
-- **`RESPOND` phase**: The final answer is generated completely isolated from the execution scratchpad, fed only factual, proven events.
+- **Context Memory**: A core loop injection mechanism `worker_memory` tracks previous tool outputs. This fixes standard LLM "amnesia" and eliminates infinite loops where the LLM repeats previous actions blindly.
+- **The 3-Layer Truth Model**: Execution cleanly separates OS truth (`returncode`), semantic completeness (`success = returncode == 0`), and runtime state (`status = "completed" | "running" | "failed"`). 
+- **`TaskContracts` (`core/post_tool_validator.py`)**: A coding task isn't "complete" just because the LLM says `"type": "final"`. The validator checks `ExecutionState` to prove that a file was *actually* created or edited before marking the requirement Complete.
+- **Auto-Healing Command Runner**: If a user request or internal test fails with a `ModuleNotFoundError`, the Tool Dispatcher automatically recognizes the missing dependency, alerts the user, and securely runs `pip install` before continuing.
 
 ---
 
@@ -170,31 +175,33 @@ When you use natural language, the agent routes to EXECUTE mode and may emit too
 | Tool | Capability |
 |---|---|
 | `read_file` | Read files (cached to prevent duplicate reads) |
-| `list_files` | Directory listing |
-| `replace_chunk`| Targeted find-and-replace (line-exact replacement) |
+| `write_file`| Secure creation of entirely new files |
+| `list_files`| Directory listing |
+| `replace_chunk`| Targeted find-and-replace using exact target strings |
 | `run_command` | Execute tests or launch long-running servers securely |
+| `delete_file` | File deletion with safety guards |
 
-### Hardened Tool Dispatcher:
+### Hardened Tool Security:
 - **Duplicate loop prevention**: If a model gets stuck calling the same tool with the exact same args 3 times, the system flags an infinite loop and forcibly halts.
-- **Parse exhaustion**: If the LLM generates invalid JSON 3 times in a row, the pipeline cleanly aborts.
-- **Batch invalidation**: If a model generates multiple tools in one turn, but includes an unknown or forbidden tool, execution of the entire batch stops immediately to prevent corrupted state.
+- **Parse exhaustion**: If the LLM generates invalid JSON 3 times in a row, the pipeline intercepts it and cleans the prompt.
+- **Strict capability configs**: The system strictly enforces `max_reasoning_passes=5` and `max_tool_calls=15` to ensure small models stay focused and predictable.
 
 ---
 
 ## File Editing & Security
 
 ### `replace_chunk`
-We never ask 7B models to rewrite 500-line files. `replace_chunk` uses exact string targeting to drop-in replacements seamlessly.
+We never ask 7B models to rewrite 500-line files. `replace_chunk` uses exact string targeting (`target_code`, `replacement_code`) to drop-in replacements seamlessly. This completely eliminates context truncation.
 
 ### `run_command`
 A strict runtime policy handles bash execution:
 1. `python <file>` is **only** permitted if `os.path.isfile(file)` returns true. The agent cannot hallucinate non-existent entry points.
-2. Long-running frameworks (`flask`, `fastapi`, `uvicorn`, `npm start`) trigger a **6-second observation window**. The process is allowed to boot and stabilize. 
-3. **Execution Semantics**: The system forces strict OS-level exit code validation. A process is only marked semantically `success=True` if it exits with `returncode == 0` or completes a successful long-running server boot. Semantic correctness is strictly decoupled from process liveness to prevent phantom execution loops.
+2. Long-running frameworks trigger an observation window allowing the process to boot and stabilize. 
+3. **Execution Semantics**: The system forces strict OS-level exit code validation to prevent phantom execution loops.
 
 ---
 
-## Project Memory & Isolation
+## Project Memory & Sandboxing
 
 ### Memory Injection
 Facts stored via `/remember` are dynamically injected into the system prompt at runtime. The LLM sees them on every pass. (Capped at 50 entries to prevent prompt bloat).
@@ -213,28 +220,42 @@ File resolution is strongly sandboxed to the project root. Path traversal (`../`
 
 ## Codebase Structure
 
-```
+```text
 local_agent/
-├── cli.py                    # Multi-turn execution orchestrator
-├── config.py                 # Hyperparameters (models, temp, budget)
+├── cli.py                        # Multi-turn execution orchestrator & Main Loop
+├── config.py                     # Hyperparameters (models, temp, budget)
+├── requirements.txt              # Project dependencies (FAISS, Rich, etc.)
 │
 ├── core/
-│   ├── orchestrator.py       # Adaptive routing & complexity scoring
-│   ├── worker.py             # Context injection & Ollama execution
-│   ├── execution_state.py    # Transactional state store (ToolEvents)
-│   ├── post_tool_validator.py# Task Contract verification rules
-│   ├── tool_result.py        # Abstract Tool Output standard
-│   └── sandbox.py            # Path resolution & security locks
+│   ├── critic.py                 # Evaluates outputs and detects hallucinations
+│   ├── execution_state.py        # Transactional state store (ToolEvents)
+│   ├── guards.py                 # Safety constraints and input validation
+│   ├── metrics.py                # Tracks reasoning passes and tool limits
+│   ├── orchestrator.py           # Adaptive routing & complexity scoring
+│   ├── planner.py                # Generates execution graphs to prevent guessing
+│   ├── post_tool_validator.py    # Task Contract verification rules
+│   ├── resource_monitor.py       # Watchdog for resource thresholds
+│   ├── sandbox.py                # Path resolution & security locks
+│   ├── tool_dispatcher.py        # Safely calls tool modules based on LLM JSON
+│   ├── tool_registry.py          # Strict tool capability schemas
+│   ├── tool_result.py            # Abstract Tool Output standard
+│   └── worker.py                 # ReAct execution loop & Context memory injection
 │
 ├── systems/
-│   ├── ollama_client.py      # LLM stream parsing & connection
-│   ├── memory.py             # Cross-session persistence
-│   └── semantic_index.py     # Codebase FAISS querying
+│   ├── memory.py                 # Cross-session conversational persistence
+│   ├── ollama_client.py          # LLM stream parsing & connection
+│   └── semantic_index.py         # Codebase FAISS querying
 │
 ├── tools/
-│   ├── replace_chunk.py      # Micro-editing engine
-│   ├── run_command.py        # Safe runtime & observation bounds
-│   └── code_indexer.py       # AST structure parsing
+│   ├── code_indexer.py           # AST structure parsing
+│   ├── context_builder.py        # Assembles prompt context for the LLM
+│   ├── delete_file.py            # Secure file deletion
+│   ├── directory_reader.py       # Workspace discovery
+│   ├── file_reader.py            # Safe read buffers
+│   ├── file_writer.py            # Creates new files
+│   ├── index_storage.py          # Serializes semantic indices to disk
+│   ├── replace_chunk.py          # Micro-editing engine (find-and-replace)
+│   └── run_command.py            # Safe runtime & observation bounds
 ```
 
 ---
