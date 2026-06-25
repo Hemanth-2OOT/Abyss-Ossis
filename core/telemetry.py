@@ -109,8 +109,7 @@ def record_task(
         "planner_used": exec_state.task_type == "coding",
         "worker_used": True,
         "validator_used": exec_state.task_type == "coding",
-        "scheduler_used": exec_state.task_type == "coding",
-        "discovery_used": any(r.type in ("search_index", "list_files") for r in exec_state.requirements)
+        "scheduler_used": exec_state.task_type == "coding"
     }
     
     log_dir = "logs"

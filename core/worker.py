@@ -74,6 +74,7 @@ If you have completed the edits/task and need no further tools, return:
 }}
 
 IMPORTANT EXECUTION RULES:
+- When there are pending requirements in your context, NEVER emit "final". You MUST execute tools to complete all pending requirements first.
 - If your last ToolResult for run_command was success=True, determine if the user's request is already satisfied. If yes, output {{"type": "final"}}.
 - Do NOT repeat the exact same run_command consecutively unless the user explicitly requested retries.
 

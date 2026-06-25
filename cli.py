@@ -561,7 +561,7 @@ def main(session):
                         })
                         
                         # Extract relationships
-                        resolved_deps = _parse_dependencies(_fpath, res.stdout, _all_files)
+                        resolved_deps = []
                         for _d_path in resolved_deps:
                             exec_state.file_relationships.setdefault(_norm, set()).add(_d_path)
                             to_read.add(_d_path)
@@ -574,6 +574,7 @@ def main(session):
             from core.planner import generate_plan
             last_failed_validation_msg = ""
             last_tool_batch_results = []
+            worker_memory = []
             
             while True:
                 if metrics.reasoning_passes >= metrics.max_reasoning_passes:
@@ -611,15 +612,43 @@ def main(session):
                 if len(facts) > 1:
                     worker_history.append({"role": "user", "content": "\n".join(facts)})
                     
-                # B. Inject Active Requirement
+                # B. Inject Execution Plan Status
+                if exec_state.requirements:
+                    plan_status = ["CURRENT EXECUTION PLAN:"]
+                    for req in exec_state.requirements:
+                        if req.status == RequirementStatus.SATISFIED:
+                            mark = "[x]"
+                        elif req.status == RequirementStatus.ACTIVE:
+                            mark = "[>]"
+                        elif req.status == RequirementStatus.FAILED:
+                            mark = "[!]"
+                        else:
+                            mark = "[ ]"
+                        plan_status.append(f"{mark} Step {req.id}: {req.type} {req.args.get('path', '')}")
+                    plan_status.append("\nNOTE: Do not output 'final' until all steps are marked with [x].")
+                    worker_history.append({"role": "user", "content": "\n".join(plan_status)})
+                    
+                # C. Inject Memory (Past actions and results)
+                worker_history.extend(worker_memory)
+                
+                # D. Inject Active Requirement
                 if prompt_injection_msg:
                     worker_history.append({"role": "user", "content": prompt_injection_msg})
                     
-                # C. Inject Immediate Context (Tool Results OR Validation Error)
+                # E. Inject Immediate Context (Tool Results OR Validation Error)
                 if last_tool_batch_results:
-                    worker_history.append({"role": "user", "content": "\n".join(last_tool_batch_results)})
+                    # We also add this to memory so the model remembers it did it
+                    memory_msg = {"role": "user", "content": "\n".join(last_tool_batch_results)}
+                    worker_history.append(memory_msg)
+                    worker_memory.append(memory_msg)
                 if last_failed_validation_msg:
-                    worker_history.append({"role": "user", "content": last_failed_validation_msg})
+                    memory_msg = {"role": "user", "content": last_failed_validation_msg}
+                    worker_history.append(memory_msg)
+                    worker_memory.append(memory_msg)
+                    
+                # Reset these so they don't get appended twice in memory
+                last_tool_batch_results = []
+                last_failed_validation_msg = ""
 
                 prompt_size  = sum(len(m.get("content", "")) for m in worker_history)
                 context_size = len(full_context or "")
@@ -706,12 +735,18 @@ def main(session):
 
                     parsed_responses = parsed_response if isinstance(parsed_response, list) else [parsed_response]
                     
+                    # Track assistant's memory
+                    worker_memory.append({"role": "assistant", "content": raw_response})
+                    
                     has_final = any(isinstance(pr, dict) and pr.get('type') == 'final' for pr in parsed_responses)
                     if has_final:
                         # ── Strict Completion Verification ──
                         # NOTE: Since we already check completion at the TOP of the loop,
                         # if the worker says "final" but we aren't finished, they are hallucinating.
-                        passed = is_finished or not exec_state.requirements
+                        if exec_state.task_type == "coding":
+                            passed = is_finished
+                        else:
+                            passed = True or not exec_state.requirements
                         validation_success = passed
                         
                         if not passed:
@@ -730,7 +765,7 @@ def main(session):
                                 if active_req:
                                     active_req.validator_failures += 1
                                     
-                                    if active_req.tool_calls == 0 and active_req.validator_failures >= 1:
+                                    if active_req.tool_calls == 0 and active_req.validator_failures >= 3:
                                         console.print(f"[red]PLANNER_CONTRACT_ERROR: Worker refuses to execute tools for {active_req.type}. Aborting.[/red]")
                                         response_content = f"PLANNER_CONTRACT_ERROR: Planner emitted impossible workflow. Worker executed 0 tools for {active_req.type}."
                                         task_completed = True
@@ -887,7 +922,7 @@ def main(session):
                                                 _post_res = read_file(raw_path)
                                                 if _post_res.success:
                                                     _all_fs = list_files().stdout.splitlines()
-                                                    _new_deps = _parse_dependencies(raw_path, _post_res.stdout, _all_fs)
+                                                    _new_deps = []
                                                     exec_state.file_relationships[norm_path] = set(_new_deps)
                                             except Exception:
                                                 pass
@@ -922,7 +957,7 @@ def main(session):
                                                 _post_res = read_file(raw_path)
                                                 if _post_res.success:
                                                     _all_fs = list_files().stdout.splitlines()
-                                                    _new_deps = _parse_dependencies(raw_path, _post_res.stdout, _all_fs)
+                                                    _new_deps = []
                                                     exec_state.file_relationships[norm_path] = set(_new_deps)
                                             except Exception:
                                                 pass
@@ -932,7 +967,6 @@ def main(session):
                                     from tools.delete_file import delete_file as df_tool
                                     try:
                                         res_dict = df_tool(raw_path)
-                                        from tools.run_command import ToolResult
                                         tool_res = ToolResult(
                                             success=res_dict["success"],
                                             stdout=res_dict["stdout"],
@@ -944,7 +978,6 @@ def main(session):
                                             # We deleted it, remove from read cache if present
                                             exec_state.files_read.discard(norm_path)
                                     except Exception as e:
-                                        from tools.run_command import ToolResult
                                         tool_res = ToolResult(success=False, stdout="", stderr=str(e), summary=str(e), status="failed")
 
                                 elif tool_name == "list_files":

@@ -1,0 +1,1 @@
+Build a modern web-based Note-Taking application. Create an index.html file with a sidebar for a list of notes and a main editor area. Also create styles.css with a sleek, dark-mode glassmorphism aesthetic, and app.js for the logic. Link them all together. Just create the foundational files with basic structure first.

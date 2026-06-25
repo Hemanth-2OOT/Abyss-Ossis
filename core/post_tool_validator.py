@@ -81,9 +81,22 @@ def update_scheduler_state(state: ExecutionState, final_declared: bool = False) 
     if not active_req:
         return False, "Validation Failed: No READY requirements available but tasks are not fully satisfied. Check for circular dependencies or blocked tasks."
 
-    # Format prompt injection using the unified schema
-    args_str = ", ".join(f"{k}='{v}'" for k, v in active_req.args.items()) if active_req.args else "None"
-    desc = f"{active_req.type}({args_str})"
+    clean_args = {}
+    for k, v in active_req.args.items():
+        if isinstance(v, str) and ("{" in v or "}" in v or "<" in v or ">" in v):
+            continue
+        clean_args[k] = v
+
+    import json
+    req_json = {
+        "id": active_req.id,
+        "type": active_req.type,
+        "args": clean_args
+    }
     
-    msg = f"Current active requirement:\n{desc}\n\nNothing else needs attention until this completes."
+    msg = (
+        f"CURRENT ACTIVE REQUIREMENT:\n```json\n{json.dumps(req_json, indent=2)}\n```\n\n"
+        f"ACTION REQUIRED: You MUST execute this requirement NOW. Output the corresponding tool call JSON to fulfill it. "
+        f"If the args are empty, you MUST infer the concrete values from the conversation history before calling the tool. Do NOT output 'final' until this tool has been executed and succeeded."
+    )
     return False, msg

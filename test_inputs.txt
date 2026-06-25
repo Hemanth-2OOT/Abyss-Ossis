@@ -1,0 +1,4 @@
+What files are in this directory?
+Create a new file called hello_qwen.py that contains a simple function to print 'Hello from Qwen'.
+Run the script you just created.
+Modify the script to also print 'Goodbye' after the first message.

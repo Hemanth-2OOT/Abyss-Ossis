@@ -74,7 +74,10 @@ Output strictly in JSON format with no markdown wrappers:
     try:
         response = chat_ollama(messages, model=PLANNER_MODEL, temperature=0.1, num_predict=128)
         return extract_json(response)
-    except Exception:
+    except Exception as e:
+        from core.resource_monitor import ResourceSafetyError
+        if isinstance(e, ResourceSafetyError):
+            raise
         return {
             "task_type": "coding",
             "needs_planner": True,

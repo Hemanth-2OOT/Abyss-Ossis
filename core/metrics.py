@@ -5,7 +5,7 @@ except ImportError:
     psutil = None
 
 class MetricsTracker:
-    def __init__(self, max_reasoning_passes: int = 3, max_tool_calls: int = 12):
+    def __init__(self, max_reasoning_passes: int = 5, max_tool_calls: int = 15):
         self.max_reasoning_passes = max_reasoning_passes
         self.max_tool_calls = max_tool_calls
         self.start_time = time.time()

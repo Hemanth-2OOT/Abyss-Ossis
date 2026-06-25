@@ -36,11 +36,12 @@ class PlannerContractError(Exception):
 def _validate_path_tool(tool_name: str):
     def validator(req, state) -> bool:
         target_norm = normalize_path(req.args.get("path") or req.args.get("file") or req.args.get("filename"))
+        has_placeholder = "{" in target_norm or "<" in target_norm
         valid_events = [e for e in state.tool_events if e.started_at is not None and e.started_at >= (req.started_at or 0.0)]
         return any(
             e.tool == tool_name 
             and e.success 
-            and is_path_match(e.args.get("path") or e.args.get("filename") or e.args.get("file"), target_norm) 
+            and (has_placeholder or is_path_match(e.args.get("path") or e.args.get("filename") or e.args.get("file"), target_norm))
             for e in valid_events
         )
     return validator
@@ -61,7 +62,7 @@ TOOL_REGISTRY = {
         description="Create or overwrite a file with specific content.",
         planner_visible=True,
         mutates_filesystem=True,
-        required_args=("path",),
+        required_args=("path", "content"),
         validator=_validate_path_tool("write_file"),
         worker_schema={
             "type": "tool_call",
@@ -76,7 +77,7 @@ TOOL_REGISTRY = {
         description="Replace a specific block of text in an existing file.",
         planner_visible=True,
         mutates_filesystem=True,
-        required_args=("path",),
+        required_args=("path", "target_code", "replacement_code"),
         validator=_validate_path_tool("replace_chunk"),
         requires_existing_file=True,
         worker_schema={
@@ -100,7 +101,7 @@ TOOL_REGISTRY = {
             "type": "tool_call",
             "tool": "delete_file",
             "args": {
-                "path": "path/to/file.py"
+                "path": "path/to/delete.py"
             }
         }
     ),

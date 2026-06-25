@@ -1,6 +1,7 @@
 from systems.ollama_client import chat_ollama
 from config import PLANNER_MODEL
 from tools.json_utils import extract_json
+import json
 from core.tool_registry import VALID_TOOLS, TOOL_REGISTRY
 
 PLANNER_TOOLS_STR = "\n".join(
@@ -40,9 +41,8 @@ Output ONLY valid JSON matching this schema:
     "Step 1 implementation directive string"
   ],
   "requirements": [
-    {{"id": "R1", "type": "search_index", "args": {{}}, "metadata": {{"purpose": "<Describe what needs to be found>"}}}},
-    {{"id": "R2", "type": "write_file", "args": {{"path": "<actual_target_filename_here>"}}, "depends_on": ["R1"]}},
-    {{"id": "R3", "type": "replace_chunk", "args": {{"path": "<actual_target_filename_here>"}}, "metadata": {{"context": ["<insert_source_file>"]}}, "depends_on": ["R2"]}}
+    {{"id": "R1", "type": "some_tool_name", "args": {{"param1": "value1"}}, "metadata": {{"purpose": "<Describe what this step does>"}}}},
+    {{"id": "R2", "type": "another_tool_name", "args": {{"param2": "{{result.R1}}"}}, "depends_on": ["R1"]}}
   ],
   "constraints": [
     "Invariant condition 1"
@@ -72,9 +72,12 @@ CRITICAL RULES:
             num_predict=1024
         )
         
+        from core.tool_registry import PlannerContractError
         try:
             payload = extract_json(response)
-            from core.tool_registry import PlannerContractError
+            print("=== RAW PLANNER JSON ===")
+            print(json.dumps(payload, indent=2))
+            print("========================")
             
             reqs = payload.get("requirements", [])
             if not reqs:
@@ -93,9 +96,12 @@ CRITICAL RULES:
                     raise PlannerContractError(f"Requirement {rt} 'args' must be an object.")
                     
                 for req_arg in tool_spec.required_args:
-                    if req_arg not in args or not str(args[req_arg]).strip() or str(args[req_arg]).lower() in ("???", "unknown", "none", "null"):
+                    val = str(args.get(req_arg, "")).strip()
+                    val_lower = val.lower()
+                    if not val or val_lower in ("???", "unknown", "none", "null"):
                         raise PlannerContractError(f"Requirement {rt} is missing required arg '{req_arg}'.")
-                        
+                    if "<actual_target_filename_here>" in val_lower or "<path>" in val_lower or "<filename>" in val_lower or "<target>" in val_lower or "todo" in val_lower:
+                        raise PlannerContractError(f"Requirement {rt} argument '{req_arg}' contains placeholder text: {val}")
                 if tool_spec.argument_validator:
                     tool_spec.argument_validator(args)
                     
